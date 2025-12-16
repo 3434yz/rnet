@@ -1,0 +1,18 @@
+[package]
+name = "rnet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mio = { version = "1.0", features = ["os-poll", "net"] }
+socket2 = { version = "0.6.1", features = ["all"] }
+slab = "0.4"
+core_affinity = "0.8"
+bytes = "1.11.0"
+
+# === 关键性能配置 ===
+[profile.release]
+lto = "fat"          # 开启最大程度的链接时优化
+codegen-units = 1    # 降低并行编译，提高优化一致性
+panic = "abort"      # 移除 unwinding 相关的代码，减小二进制体积，略微提高性能
+opt-level = 3        # 最高优化等级
