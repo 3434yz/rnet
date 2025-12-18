@@ -2,6 +2,7 @@ use bytes::BytesMut;
 use mio::net::TcpStream;
 use std::net::SocketAddr;
 
+// TODO 增加 GFD
 pub struct Connection {
     pub stream: TcpStream,
     pub addr: SocketAddr,

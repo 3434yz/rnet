@@ -1,48 +1,77 @@
 use crate::codec::Codec;
 use crate::connection::Connection;
 use crate::handler::{Action, Context, EventHandler};
+
 use bytes::Buf;
+use crossbeam::channel::{Receiver, Sender};
 use mio::net::TcpListener;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
+
+use crate::command::{pack_session_id,unpack_session_id, Request, Response};
+use mio::event::Event;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 const SERVER_TOKEN: Token = Token(usize::MAX);
+const WAKE_TOKEN: Token = Token(usize::MAX - 1);
 const SCRATCH_BUF_SIZE: usize = 64 * 1024;
 const EVENTS_CAP: usize = 1024;
 
-pub struct Engine<H, C>
+pub struct Engine<H, C, J>
 where
     H: EventHandler,
     C: Codec,
 {
+    engine_id: usize,
     poll: Poll,
     listener: TcpListener,
     connections: Slab<Connection>,
     handler: H,
     codec: C,
     scratch_buf: Box<[u8; SCRATCH_BUF_SIZE]>,
+    request_sender: Sender<Request<J>>,
+    response_receiver: Receiver<Response>,
+    waker: Arc<Waker>,
 }
 
-impl<H, C> Engine<H, C>
+impl<H, C, J> Engine<H, C, J>
 where
-    H: EventHandler<Message = C::Message>, // 约束：Handler 处理的消息必须匹配 Codec
-    C: Codec + Clone, // Codec 需要 Clone 给每个 Worker (或者 Engine 本身就是每个 Worker 一个)
+    H: EventHandler<Message = C::Message, Job = J>,
+    C: Codec + Clone,
 {
-    pub fn new(mut listener: TcpListener, handler: H, codec: C) -> io::Result<Self> {
+    pub fn new(
+        engine_id: usize,
+        mut listener: TcpListener,
+        handler: H,
+        codec: C,
+        request_sender: Sender<Request<J>>,
+        response_receiver: Receiver<Response>,
+    ) -> io::Result<Self> {
         let poll = Poll::new()?;
 
         poll.registry()
             .register(&mut listener, SERVER_TOKEN, Interest::READABLE)?;
 
+        let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
+        let waker = Arc::new(waker);
+
         Ok(Self {
+            engine_id,
             poll,
             listener,
             connections: Slab::with_capacity(4096),
             handler,
             codec,
             scratch_buf: Box::new([0u8; SCRATCH_BUF_SIZE]),
+            request_sender,
+            response_receiver,
+            waker,
         })
+    }
+
+    pub fn get_waker(&self) -> Arc<Waker> {
+        self.waker.clone()
     }
 
     pub fn run(&mut self) -> io::Result<()> {
@@ -59,12 +88,12 @@ where
                 match event.token() {
                     SERVER_TOKEN => self.accept_loop()?,
                     token => self.conn_event(token)?,
+                    WAKE_TOKEN=>self.process_responses()?,
                 }
             }
         }
     }
 
-    #[inline]
     fn accept_loop(&mut self) -> io::Result<()> {
         loop {
             match self.listener.accept() {
@@ -105,6 +134,7 @@ where
                         Action::None => {
                             entry.insert(conn);
                         }
+                        Action::Publish(_)=>{}
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -117,7 +147,6 @@ where
         Ok(())
     }
 
-    #[inline]
     fn conn_event(&mut self, token: Token) -> io::Result<()> {
         let key = token.into();
         if let Some(conn) = self.connections.get_mut(key) {
@@ -144,7 +173,6 @@ where
                 }
             }
 
-            // 2. Decode Loop (关键新增)
             if !closed {
                 loop {
                     // 调用 Codec 解码
@@ -158,7 +186,7 @@ where
                             };
 
                             // 此时 msg 已经是完整的包
-                            match self.handler.on_traffic(&mut ctx, msg) {
+                            match self.handler.on_message(&mut ctx, msg) {
                                 Action::Close => {
                                     closed = true;
                                     break;
@@ -167,6 +195,13 @@ where
                                     // 可以在这里 encode 回包，但通常由 Handler 往 ctx.out_buf 写
                                     // 如果 Handler 想回包，它应该自己处理 encode，或者我们提供 helper
                                     // 目前模型：Handler 拿到 msg，自己决定往 out_buf 写什么 (bytes)
+                                }
+                                Action::Publish(job) => {
+                                    let req = Request {
+                                        session_id: pack_session_id(self.engine_id, token.0),
+                                        job,
+                                    };
+                                    let _ = self.request_sender.send(req);
                                 }
                             }
                         }
@@ -205,6 +240,56 @@ where
                 self.handler.on_close(&mut ctx);
                 let _ = self.poll.registry().deregister(&mut conn.stream);
                 self.connections.remove(key);
+            }
+        }
+        Ok(())
+    }
+
+    fn process_responses(&mut self)->io::Result<()> {
+        while let Ok(response) = self.response_receiver.try_recv() {
+            let (engine_id, token_usize) = unpack_session_id(response.session_id);
+
+            if engine_id != self.engine_id {
+                eprintln!("Error: Received response for wrong engine {}", engine_id);
+                continue;
+            }
+
+            if let Some(conn) = self.connections.get_mut(token_usize) {
+                conn.out_buf.extend_from_slice(&response.data);
+
+                let mut closed = false;
+                while !conn.out_buf.is_empty() {
+                    match conn.stream.write(&conn.out_buf) {
+                        Ok(n) => {
+                            conn.out_buf.advance(n);
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            eprintln!("Write error in process_responses: {}", e);
+                            closed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if closed {
+                    // 构造临时 Context 触发 on_close 回调
+                    let mut ctx = Context {
+                        local_addr: conn.addr,
+                        peer_addr: conn.addr,
+                        out_buf: &mut conn.out_buf,
+                    };
+                    self.handler.on_close(&mut ctx);
+
+                    let _ = self.poll.registry().deregister(&mut conn.stream);
+                    self.connections.remove(token_usize);
+                }
+            } else {
+                // 这种情况可能发生：
+                // Worker 在处理任务时，客户端断开了连接，Engine 已经移除了 Connection。
+                // 此时 Worker 发回来的结果只能丢弃。
+                // 这是一个正常的竞态条件，无需 Panic。
             }
         }
         Ok(())

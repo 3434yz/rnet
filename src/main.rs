@@ -4,30 +4,30 @@ use mio::net::TcpListener;
 use rnet::codec::RawCodec;
 use rnet::engine::Engine;
 use rnet::handler::{Action, Context, EventHandler};
+use rnet::worker::start_worker;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
 use std::thread;
 
-// 业务逻辑：Echo Handler
-// Derive Clone/Copy 是因为 EchoHandler 是无状态的 (ZST)，
-// 每个 Worker 线程拿一个副本即可。
 #[derive(Clone, Copy)]
-struct EchoHandler;
+struct MyHandler;
 
-impl EventHandler for EchoHandler {
+impl EventHandler for MyHandler {
     type Message = BytesMut;
-    fn on_open(&self, _ctx: &mut Context) -> Action {
+    type Job = BytesMut;
+
+    fn on_open(&self, _ctx: &mut Context) -> Action<Self::Job> {
         println!("New Connect");
         Action::None
     }
 
-    fn on_traffic(&self, ctx: &mut Context, in_buf: Self::Message) -> Action {
+    fn on_message(&self, ctx: &mut Context, in_buf: Self::Message) -> Action<Self::Job> {
         ctx.out_buf.extend_from_slice(&in_buf);
         Action::None
     }
 
-    fn on_close(&self, _ctx: &mut Context) -> Action {
+    fn on_close(&self, _ctx: &mut Context) -> Action<Self::Job> {
         println!("Close Connect");
         Action::None
     }
@@ -53,6 +53,11 @@ fn create_reuse_port_listener(addr_str: &str) -> io::Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into()))
 }
 
+struct EngineInitCtx<J> {
+    engine: Engine<MyHandler, RawCodec, J>,
+    core_id: core_affinity::CoreId,
+}
+
 fn main() -> io::Result<()> {
     let core_ids = core_affinity::get_core_ids().unwrap();
     println!("Total logical cores: {}", core_ids.len());
@@ -66,38 +71,60 @@ fn main() -> io::Result<()> {
         worker_cores.len()
     );
 
-    let mut handles = Vec::new();
+    let mut engine_handles = Vec::new();
+    let (req_tx, req_rx) = crossbeam::channel::unbounded();
+    let mut engine_registry = Vec::new();
+    let mut pending_engines = Vec::new();
+
 
     for (i, core_id) in worker_cores.into_iter().enumerate() {
-        let core_id = core_id.clone();
+        let (resp_tx, resp_rx) = crossbeam::channel::unbounded();
 
-        let handle = thread::spawn(move || {
-            // 1. 绑核
-            if !core_affinity::set_for_current(core_id) {
-                eprintln!("Worker {} failed to pin to core", i);
-            }
+        let addr = "127.0.0.1:9000";
+        let listener = match create_reuse_port_listener(addr) {
+            Ok(l) => l,
+            Err(e) => panic!("Worker {} bind failed: {}", i, e),
+        };
 
-            // 2. 创建 Listener (SO_REUSEPORT)
-            let addr = "127.0.0.1:9000";
-            let listener = match create_reuse_port_listener(addr) {
-                Ok(l) => l,
-                Err(e) => panic!("Worker {} bind failed: {}", i, e),
-            };
+        // 3. 初始化 Engine
+        let handler = MyHandler;
+        let codec = RawCodec;
 
-            // 3. 初始化 Engine
-            let handler = EchoHandler;
-            let codec = RawCodec;
-            let mut engine = Engine::new(listener, handler, codec).unwrap();
-
-            // 4. 启动 Loop
-            if let Err(e) = engine.run() {
-                eprintln!("Worker {} engine failed: {}", i, e);
-            }
-        });
-        handles.push(handle);
+        let engine = Engine::new(i, listener, handler, codec, req_tx.clone(), resp_rx)?;
+        engine_registry.push((resp_tx, engine.get_waker()));
+        pending_engines.push(EngineInitCtx { engine, core_id });
     }
 
-    for handle in handles {
+    println!("Starting 4 Workers...");
+    for i in 0..4 {
+        let req_rx = req_rx.clone();
+        let registry = engine_registry.clone();
+        start_worker(i, req_rx, registry, |job| -> Vec<u8> {
+            // thread::sleep(std::time::Duration::from_millis(100));
+            // let response_str = format!("Processed: {:?}", job);
+            // response_str.into_bytes()
+            job.to_vec()
+        });
+    }
+
+    for (i, ctx) in pending_engines.into_iter().enumerate() {
+        let mut engine = ctx.engine;
+        let core_id = ctx.core_id;
+
+        let handle = thread::spawn(move || {
+            if !core_affinity::set_for_current(core_id) {
+                eprintln!("Engine {} failed to pin to core", i);
+            }
+            if let Err(e) = engine.run() {
+                eprintln!("Engine {} failed: {}", i, e);
+            }
+        });
+        engine_handles.push(handle);
+    }
+
+    drop(engine_registry);
+
+    for handle in engine_handles {
         handle.join().unwrap();
     }
 
