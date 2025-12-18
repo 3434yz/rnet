@@ -1,16 +1,16 @@
-use crate::codec::Codec;
 use crate::connection::Connection;
 use crate::handler::{Action, Context, EventHandler};
 
-use bytes::Buf;
+use bytes::{Buf, BufMut, BytesMut};
 use crossbeam::channel::{Receiver, Sender};
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
 
-use crate::command::{pack_session_id,unpack_session_id, Request, Response};
+use crate::command::{Request, Response, pack_session_id, unpack_session_id};
 use mio::event::Event;
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 const SERVER_TOKEN: Token = Token(usize::MAX);
@@ -18,34 +18,31 @@ const WAKE_TOKEN: Token = Token(usize::MAX - 1);
 const SCRATCH_BUF_SIZE: usize = 64 * 1024;
 const EVENTS_CAP: usize = 1024;
 
-pub struct Engine<H, C, J>
+pub struct Engine<H>
 where
     H: EventHandler,
-    C: Codec,
 {
     engine_id: usize,
     poll: Poll,
     listener: TcpListener,
+    local_addr: SocketAddr,
     connections: Slab<Connection>,
     handler: H,
-    codec: C,
-    scratch_buf: Box<[u8; SCRATCH_BUF_SIZE]>,
-    request_sender: Sender<Request<J>>,
+    scratch_buf: [u8; SCRATCH_BUF_SIZE],
+    request_sender: Sender<Request<H::Job>>,
     response_receiver: Receiver<Response>,
     waker: Arc<Waker>,
 }
 
-impl<H, C, J> Engine<H, C, J>
+impl<H> Engine<H>
 where
-    H: EventHandler<Message = C::Message, Job = J>,
-    C: Codec + Clone,
+    H: EventHandler,
 {
     pub fn new(
         engine_id: usize,
         mut listener: TcpListener,
         handler: H,
-        codec: C,
-        request_sender: Sender<Request<J>>,
+        request_sender: Sender<Request<H::Job>>,
         response_receiver: Receiver<Response>,
     ) -> io::Result<Self> {
         let poll = Poll::new()?;
@@ -55,15 +52,17 @@ where
 
         let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
         let waker = Arc::new(waker);
+        let local_addr = listener.local_addr()?;
+        let scratch_buf = [0; SCRATCH_BUF_SIZE];
 
         Ok(Self {
             engine_id,
             poll,
             listener,
+            local_addr,
             connections: Slab::with_capacity(4096),
             handler,
-            codec,
-            scratch_buf: Box::new([0u8; SCRATCH_BUF_SIZE]),
+            scratch_buf,
             request_sender,
             response_receiver,
             waker,
@@ -87,8 +86,8 @@ where
             for event in events.iter() {
                 match event.token() {
                     SERVER_TOKEN => self.accept_loop()?,
-                    token => self.conn_event(token)?,
-                    WAKE_TOKEN=>self.process_responses()?,
+                    WAKE_TOKEN => self.process_responses()?,
+                    token => self.conn_event(token, &event)?,
                 }
             }
         }
@@ -97,7 +96,7 @@ where
     fn accept_loop(&mut self) -> io::Result<()> {
         loop {
             match self.listener.accept() {
-                Ok((mut stream, addr)) => {
+                Ok((mut stream, peer_addr)) => {
                     // 1. 设置 Socket 选项 (Nodelay 是必须的)
                     if let Err(e) = stream.set_nodelay(true) {
                         eprintln!("set_nodelay failed: {}", e);
@@ -117,12 +116,12 @@ where
                         .register(&mut stream, token, Interest::READABLE)?;
 
                     // 4. 创建 Connection 对象
-                    let mut conn = Connection::new(stream, addr);
+                    let mut conn = Connection::new(stream, self.local_addr, peer_addr);
 
                     // 5. 触发 OnOpen 回调
                     let mut ctx = Context {
-                        local_addr: conn.addr, // 简化处理，暂时用 remote 代替 local 用于展示
-                        peer_addr: conn.addr,
+                        local_addr: conn.local_addr,
+                        peer_addr: conn.peer_addr,
                         out_buf: &mut conn.out_buf,
                     };
 
@@ -134,7 +133,7 @@ where
                         Action::None => {
                             entry.insert(conn);
                         }
-                        Action::Publish(_)=>{}
+                        Action::Publish(_) => {}
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -147,105 +146,94 @@ where
         Ok(())
     }
 
-    fn conn_event(&mut self, token: Token) -> io::Result<()> {
+    fn conn_event(&mut self, token: Token, event: &Event) -> io::Result<()> {
         let key = token.into();
-        if let Some(conn) = self.connections.get_mut(key) {
-            let mut closed = false;
+        let conn = match self.connections.get_mut(key) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
 
-            // 1. Read into in_buf
+        if conn.closed {
+            return Ok(());
+        }
+
+        let mut closed = false;
+        if event.is_readable() {
             loop {
-                match conn.stream.read(&mut self.scratch_buf[..]) {
+                match conn.stream.read(&mut self.scratch_buf) {
                     Ok(0) => {
                         closed = true;
                         break;
                     }
                     Ok(n) => {
                         conn.in_buf.extend_from_slice(&self.scratch_buf[..n]);
-                        if n < SCRATCH_BUF_SIZE {
-                            break;
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        closed = true;
-                        break;
-                    }
-                }
-            }
+                        let mut ctx = Context {
+                            local_addr: conn.local_addr,
+                            peer_addr: conn.peer_addr,
+                            out_buf: &mut conn.out_buf,
+                        };
 
-            if !closed {
-                loop {
-                    // 调用 Codec 解码
-                    match self.codec.decode(&mut conn.in_buf) {
-                        Ok(Some(msg)) => {
-                            // 解码成功，调用 Handler
-                            let mut ctx = Context {
-                                local_addr: conn.addr,
-                                peer_addr: conn.addr,
-                                out_buf: &mut conn.out_buf,
-                            };
-
-                            // 此时 msg 已经是完整的包
-                            match self.handler.on_message(&mut ctx, msg) {
-                                Action::Close => {
-                                    closed = true;
-                                    break;
-                                }
-                                Action::None => {
-                                    // 可以在这里 encode 回包，但通常由 Handler 往 ctx.out_buf 写
-                                    // 如果 Handler 想回包，它应该自己处理 encode，或者我们提供 helper
-                                    // 目前模型：Handler 拿到 msg，自己决定往 out_buf 写什么 (bytes)
-                                }
-                                Action::Publish(job) => {
-                                    let req = Request {
-                                        session_id: pack_session_id(self.engine_id, token.0),
-                                        job,
-                                    };
-                                    let _ = self.request_sender.send(req);
-                                }
+                        let action = self.handler.on_traffic(&mut ctx, &mut conn.in_buf);
+                        match action {
+                            Action::None => {} // 用户处理完了，或者只是读了一半等待更多数据
+                            Action::Close => {
+                                closed = true;
+                            }
+                            Action::Publish(job) => {
+                                // 发送给 Worker
+                                let req = Request {
+                                    session_id: pack_session_id(self.engine_id, usize::from(token)),
+                                    job,
+                                };
+                                let _ = self.request_sender.send(req);
                             }
                         }
-                        Ok(None) => {
-                            // 数据不够，等待更多数据
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("Codec Error: {}", e);
-                            closed = true;
+
+                        // 如果读取没填满 scratch_buf，说明内核缓冲区空了，跳出读取循环
+                        if n < self.scratch_buf.len() {
                             break;
                         }
                     }
-                }
-            }
-
-            // 3. Write
-            while !conn.out_buf.is_empty() {
-                match conn.stream.write(&conn.out_buf) {
-                    Ok(n) => conn.out_buf.advance(n),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => {
                         closed = true;
                         break;
                     }
                 }
-            }
 
-            if closed {
-                let mut ctx = Context {
-                    local_addr: conn.addr,
-                    peer_addr: conn.addr,
-                    out_buf: &mut conn.out_buf,
-                };
-                self.handler.on_close(&mut ctx);
-                let _ = self.poll.registry().deregister(&mut conn.stream);
-                self.connections.remove(key);
+                if closed {
+                    break
+                }
             }
+        }
+
+        // 3. Write
+        while !conn.out_buf.is_empty() {
+            match conn.stream.write(&conn.out_buf) {
+                Ok(n) => conn.out_buf.advance(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+
+        if closed {
+            let mut ctx = Context {
+                local_addr: conn.local_addr,
+                peer_addr: conn.local_addr,
+                out_buf: &mut conn.out_buf,
+            };
+            self.handler.on_close(&mut ctx);
+            let _ = self.poll.registry().deregister(&mut conn.stream);
+            self.connections.remove(key);
         }
         Ok(())
     }
 
-    fn process_responses(&mut self)->io::Result<()> {
+    fn process_responses(&mut self) -> io::Result<()> {
         while let Ok(response) = self.response_receiver.try_recv() {
             let (engine_id, token_usize) = unpack_session_id(response.session_id);
 
@@ -274,14 +262,12 @@ where
                 }
 
                 if closed {
-                    // 构造临时 Context 触发 on_close 回调
                     let mut ctx = Context {
-                        local_addr: conn.addr,
-                        peer_addr: conn.addr,
+                        local_addr: conn.local_addr,
+                        peer_addr: conn.local_addr,
                         out_buf: &mut conn.out_buf,
                     };
                     self.handler.on_close(&mut ctx);
-
                     let _ = self.poll.registry().deregister(&mut conn.stream);
                     self.connections.remove(token_usize);
                 }

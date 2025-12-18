@@ -1,7 +1,6 @@
 use bytes::BytesMut;
 use core_affinity;
 use mio::net::TcpListener;
-use rnet::codec::RawCodec;
 use rnet::engine::Engine;
 use rnet::handler::{Action, Context, EventHandler};
 use rnet::worker::start_worker;
@@ -14,7 +13,6 @@ use std::thread;
 struct MyHandler;
 
 impl EventHandler for MyHandler {
-    type Message = BytesMut;
     type Job = BytesMut;
 
     fn on_open(&self, _ctx: &mut Context) -> Action<Self::Job> {
@@ -22,8 +20,17 @@ impl EventHandler for MyHandler {
         Action::None
     }
 
-    fn on_message(&self, ctx: &mut Context, in_buf: Self::Message) -> Action<Self::Job> {
-        ctx.out_buf.extend_from_slice(&in_buf);
+    fn on_traffic(&self, ctx: &mut Context, buf: &mut BytesMut) -> Action<Self::Job> {
+        if buf.is_empty() {
+            return Action::None;
+        }
+        let data = buf.split_to(buf.len());
+        let msg_str = String::from_utf8_lossy(&data);
+        if msg_str.trim() == "slow" {
+            return Action::Publish(data);
+        }
+        // 直接写回 out_buf
+        ctx.out_buf.extend_from_slice(&data);
         Action::None
     }
 
@@ -53,8 +60,8 @@ fn create_reuse_port_listener(addr_str: &str) -> io::Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into()))
 }
 
-struct EngineInitCtx<J> {
-    engine: Engine<MyHandler, RawCodec, J>,
+struct EngineInitCtx {
+    engine: Engine<MyHandler>,
     core_id: core_affinity::CoreId,
 }
 
@@ -76,7 +83,6 @@ fn main() -> io::Result<()> {
     let mut engine_registry = Vec::new();
     let mut pending_engines = Vec::new();
 
-
     for (i, core_id) in worker_cores.into_iter().enumerate() {
         let (resp_tx, resp_rx) = crossbeam::channel::unbounded();
 
@@ -88,9 +94,8 @@ fn main() -> io::Result<()> {
 
         // 3. 初始化 Engine
         let handler = MyHandler;
-        let codec = RawCodec;
 
-        let engine = Engine::new(i, listener, handler, codec, req_tx.clone(), resp_rx)?;
+        let engine = Engine::new(i, listener, handler, req_tx.clone(), resp_rx)?;
         engine_registry.push((resp_tx, engine.get_waker()));
         pending_engines.push(EngineInitCtx { engine, core_id });
     }
@@ -100,7 +105,7 @@ fn main() -> io::Result<()> {
         let req_rx = req_rx.clone();
         let registry = engine_registry.clone();
         start_worker(i, req_rx, registry, |job| -> Vec<u8> {
-            // thread::sleep(std::time::Duration::from_millis(100));
+            thread::sleep(std::time::Duration::from_secs(5));
             // let response_str = format!("Processed: {:?}", job);
             // response_str.into_bytes()
             job.to_vec()

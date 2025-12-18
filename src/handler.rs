@@ -14,13 +14,11 @@ pub enum Action<J> {
 }
 
 pub trait EventHandler: Send + Sync {
-    // 来自 TCP 的消息类型 (由 Codec 产出)
-    type Message;
     type Job: Send + 'static;
 
     fn on_open(&self, ctx: &mut Context) -> Action<Self::Job>;
 
-    fn on_message(&self, ctx: &mut Context, msg: Self::Message) -> Action<Self::Job>;
+    fn on_traffic(&self, ctx: &mut Context, buf: &mut BytesMut) -> Action<Self::Job>;
 
     fn on_close(&self, ctx: &mut Context) -> Action<Self::Job>;
 }

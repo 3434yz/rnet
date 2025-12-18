@@ -1,4 +1,4 @@
-pub mod codec;
+// pub mod codec;
 pub mod command;
 pub mod connection;
 pub mod engine;
