@@ -1,24 +1,26 @@
+use crate::buffer::IOBuffer;
+use crate::command::{Request, Response, pack_session_id, unpack_session_id};
 use crate::connection::Connection;
 use crate::handler::{Action, Context, EventHandler};
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use crossbeam::channel::{Receiver, Sender};
+use mio::event::Event;
 use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
 
-use crate::command::{Request, Response, pack_session_id, unpack_session_id};
-use mio::event::Event;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 const SERVER_TOKEN: Token = Token(usize::MAX);
 const WAKE_TOKEN: Token = Token(usize::MAX - 1);
-const SCRATCH_BUF_SIZE: usize = 64 * 1024;
+const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 const EVENTS_CAP: usize = 1024;
 
-pub struct Engine<H>
+pub struct Eventloop<H>
 where
     H: EventHandler,
 {
@@ -28,13 +30,14 @@ where
     local_addr: SocketAddr,
     connections: Slab<Connection>,
     handler: H,
-    scratch_buf: [u8; SCRATCH_BUF_SIZE],
+    buffer: Box<IOBuffer>,
+    cache: BytesMut,
     request_sender: Sender<Request<H::Job>>,
     response_receiver: Receiver<Response>,
     waker: Arc<Waker>,
 }
 
-impl<H> Engine<H>
+impl<H> Eventloop<H>
 where
     H: EventHandler,
 {
@@ -53,7 +56,8 @@ where
         let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
         let waker = Arc::new(waker);
         let local_addr = listener.local_addr()?;
-        let scratch_buf = [0; SCRATCH_BUF_SIZE];
+        let buffer = Box::new(IOBuffer::new(DEFAULT_BUF_SIZE));
+        let cache = BytesMut::with_capacity(DEFAULT_BUF_SIZE);
 
         Ok(Self {
             engine_id,
@@ -62,7 +66,8 @@ where
             local_addr,
             connections: Slab::with_capacity(4096),
             handler,
-            scratch_buf,
+            buffer,
+            cache,
             request_sender,
             response_receiver,
             waker,
@@ -87,7 +92,7 @@ where
                 match event.token() {
                     SERVER_TOKEN => self.accept_loop()?,
                     WAKE_TOKEN => self.process_responses()?,
-                    token => self.conn_event(token, &event)?,
+                    token => self.process_io(token, &event)?,
                 }
             }
         }
@@ -115,17 +120,10 @@ where
                         .registry()
                         .register(&mut stream, token, Interest::READABLE)?;
 
-                    // 4. 创建 Connection 对象
-                    let mut conn = Connection::new(stream, self.local_addr, peer_addr);
-
-                    // 5. 触发 OnOpen 回调
-                    let mut ctx = Context {
-                        local_addr: conn.local_addr,
-                        peer_addr: conn.peer_addr,
-                        out_buf: &mut conn.out_buf,
-                    };
-
-                    match self.handler.on_open(&mut ctx) {
+                    let raw_ptr = self.buffer.as_mut() as *mut IOBuffer;
+                    let ptr = NonNull::new(raw_ptr).expect("create ptr error");
+                    let mut conn = Connection::new(stream, self.local_addr, peer_addr, ptr);
+                    match self.handler.on_open(&mut conn) {
                         Action::Close => {
                             // 如果用户在 OnOpen 里要求关闭，就不 Insert 了
                             // Drop conn 会自动关闭 socket
@@ -146,7 +144,7 @@ where
         Ok(())
     }
 
-    fn conn_event(&mut self, token: Token, event: &Event) -> io::Result<()> {
+    fn process_io(&mut self, token: Token, event: &Event) -> io::Result<()> {
         let key = token.into();
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
@@ -160,22 +158,16 @@ where
         let mut closed = false;
         if event.is_readable() {
             loop {
-                match conn.stream.read(&mut self.scratch_buf) {
+                match conn.stream.read(&mut self.buffer) {
                     Ok(0) => {
                         closed = true;
                         break;
                     }
                     Ok(n) => {
-                        conn.in_buf.extend_from_slice(&self.scratch_buf[..n]);
-                        let mut ctx = Context {
-                            local_addr: conn.local_addr,
-                            peer_addr: conn.peer_addr,
-                            out_buf: &mut conn.out_buf,
-                        };
-
-                        let action = self.handler.on_traffic(&mut ctx, &mut conn.in_buf);
+                        self.buffer.read(n);
+                        let action = self.handler.on_traffic(conn, &mut self.cache);
                         match action {
-                            Action::None => {} // 用户处理完了，或者只是读了一半等待更多数据
+                            Action::None => {}
                             Action::Close => {
                                 closed = true;
                             }
@@ -189,10 +181,8 @@ where
                             }
                         }
 
-                        // 如果读取没填满 scratch_buf，说明内核缓冲区空了，跳出读取循环
-                        if n < self.scratch_buf.len() {
-                            break;
-                        }
+                        let buffer = self.buffer.remaining_bytes();
+                        conn.in_buf.extend_from_slice(buffer);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => {
@@ -202,7 +192,7 @@ where
                 }
 
                 if closed {
-                    break
+                    break;
                 }
             }
         }
@@ -223,7 +213,7 @@ where
         if closed {
             let mut ctx = Context {
                 local_addr: conn.local_addr,
-                peer_addr: conn.local_addr,
+                peer_addr: conn.peer_addr,
                 out_buf: &mut conn.out_buf,
             };
             self.handler.on_close(&mut ctx);
@@ -243,7 +233,7 @@ where
             }
 
             if let Some(conn) = self.connections.get_mut(token_usize) {
-                conn.out_buf.extend_from_slice(&response.data);
+                let _ = conn.write(&response.data);
 
                 let mut closed = false;
                 while !conn.out_buf.is_empty() {
@@ -264,7 +254,7 @@ where
                 if closed {
                     let mut ctx = Context {
                         local_addr: conn.local_addr,
-                        peer_addr: conn.local_addr,
+                        peer_addr: conn.peer_addr,
                         out_buf: &mut conn.out_buf,
                     };
                     self.handler.on_close(&mut ctx);

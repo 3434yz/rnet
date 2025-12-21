@@ -1,4 +1,5 @@
 // pub mod codec;
+pub mod buffer;
 pub mod command;
 pub mod connection;
 pub mod engine;

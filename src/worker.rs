@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use std::thread;
+use crate::command::{Request, Response, unpack_session_id};
 use crossbeam::channel::{Receiver, Sender};
 use mio::Waker;
-use crate::command::{Request, Response, unpack_session_id};
+use std::sync::Arc;
+use std::thread;
 
 /// 启动一个 Worker 线程
 ///
@@ -16,16 +16,14 @@ pub fn start_worker<J, F>(
     task_receiver: Receiver<Request<J>>,
     engine_registry: Vec<(Sender<Response>, Arc<Waker>)>,
     processor: F,
-)
-where
-    J: Send + 'static, // Job 必须能跨线程发送
+) where
+    J: Send + 'static,                           // Job 必须能跨线程发送
     F: Fn(J) -> Vec<u8> + Send + Sync + 'static, // 业务逻辑函数
 {
     let registry = engine_registry;
     thread::spawn(move || {
         // 循环等待任务。recv() 是阻塞的，没有任务时线程会挂起，不消耗 CPU。
         while let Ok(req) = task_receiver.recv() {
-
             // 1. 路由解析：这个任务是谁发来的？
             let (engine_id, _token) = unpack_session_id(req.session_id);
 
@@ -44,7 +42,10 @@ where
             if let Some((resp_sender, waker)) = registry.get(engine_id) {
                 // Step A: 把信扔进 Engine 的信箱
                 if let Err(e) = resp_sender.send(response) {
-                    eprintln!("Worker {}: Failed to send response to Engine {}: {}", id, engine_id, e);
+                    eprintln!(
+                        "Worker {}: Failed to send response to Engine {}: {}",
+                        id, engine_id, e
+                    );
                     continue;
                 }
 
@@ -54,7 +55,10 @@ where
                     eprintln!("Worker {}: Failed to wake Engine {}: {}", id, engine_id, e);
                 }
             } else {
-                eprintln!("Worker {}: Received task from unknown Engine ID {}", id, engine_id);
+                eprintln!(
+                    "Worker {}: Received task from unknown Engine ID {}",
+                    id, engine_id
+                );
             }
         }
 

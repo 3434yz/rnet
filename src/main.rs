@@ -1,11 +1,12 @@
 use bytes::BytesMut;
 use core_affinity;
 use mio::net::TcpListener;
-use rnet::engine::Engine;
+use rnet::connection::Connection;
+use rnet::engine::Eventloop;
 use rnet::handler::{Action, Context, EventHandler};
 use rnet::worker::start_worker;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::thread;
 
@@ -15,22 +16,15 @@ struct MyHandler;
 impl EventHandler for MyHandler {
     type Job = BytesMut;
 
-    fn on_open(&self, _ctx: &mut Context) -> Action<Self::Job> {
+    fn on_open(&self, _ctx: &mut Connection) -> Action<Self::Job> {
         println!("New Connect");
         Action::None
     }
 
-    fn on_traffic(&self, ctx: &mut Context, buf: &mut BytesMut) -> Action<Self::Job> {
-        if buf.is_empty() {
-            return Action::None;
+    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action<Self::Job> {
+        if let Some(datas) = conn.next(None, cache) {
+            let _ = conn.write(datas);
         }
-        let data = buf.split_to(buf.len());
-        let msg_str = String::from_utf8_lossy(&data);
-        if msg_str.trim() == "slow" {
-            return Action::Publish(data);
-        }
-        // 直接写回 out_buf
-        ctx.out_buf.extend_from_slice(&data);
         Action::None
     }
 
@@ -61,7 +55,7 @@ fn create_reuse_port_listener(addr_str: &str) -> io::Result<TcpListener> {
 }
 
 struct EngineInitCtx {
-    engine: Engine<MyHandler>,
+    engine: Eventloop<MyHandler>,
     core_id: core_affinity::CoreId,
 }
 
@@ -95,7 +89,7 @@ fn main() -> io::Result<()> {
         // 3. 初始化 Engine
         let handler = MyHandler;
 
-        let engine = Engine::new(i, listener, handler, req_tx.clone(), resp_rx)?;
+        let engine = Eventloop::new(i, listener, handler, req_tx.clone(), resp_rx)?;
         engine_registry.push((resp_tx, engine.get_waker()));
         pending_engines.push(EngineInitCtx { engine, core_id });
     }
