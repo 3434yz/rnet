@@ -1,15 +1,17 @@
-use crate::buffer::IOBuffer;
+use crate::io_buffer::IOBuffer;
+use crate::socket_addr::NetworkAddress;
+
 use bytes::{Buf, BytesMut};
-use mio::net::TcpStream;
+
+use crate::socket::Socket;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::ptr::NonNull;
 
 // TODO 增加 GFD
 pub struct Connection {
-    pub(crate) stream: TcpStream,
-    pub(crate) local_addr: SocketAddr,
-    pub(crate) peer_addr: SocketAddr,
+    pub(crate) socket: Socket,
+    pub(crate) local_addr: NetworkAddress,
+    pub(crate) peer_addr: NetworkAddress,
     pub(crate) closed: bool,
     pub(crate) in_buf: BytesMut,
     pub(crate) out_buf: BytesMut,
@@ -18,13 +20,13 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(
-        stream: TcpStream,
-        local_addr: SocketAddr,
-        peer_addr: SocketAddr,
+        socket: Socket,
+        local_addr: NetworkAddress,
+        peer_addr: NetworkAddress,
         buf_ptr: NonNull<IOBuffer>,
     ) -> Self {
         Self {
-            stream,
+            socket,
             local_addr,
             peer_addr,
             closed: false,
@@ -230,7 +232,7 @@ impl Write for Connection {
             return Ok(buf.len());
         }
 
-        match self.stream.write(buf) {
+        match self.socket.write(buf) {
             Ok(n) => {
                 if n < buf.len() {
                     self.out_buf.extend_from_slice(&buf[n..]);

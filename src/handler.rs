@@ -1,9 +1,11 @@
 use crate::connection::Connection;
+use crate::socket_addr::NetworkAddress;
+
 use bytes::BytesMut;
 
 pub struct Context<'a> {
-    pub local_addr: std::net::SocketAddr,
-    pub peer_addr: std::net::SocketAddr,
+    pub local_addr: NetworkAddress,
+    pub peer_addr: NetworkAddress,
     pub out_buf: &'a mut BytesMut,
 }
 
