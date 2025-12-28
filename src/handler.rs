@@ -16,8 +16,8 @@ pub enum Action<J> {
     // Shutdown,
 }
 
-pub trait EventHandler: Send + Sync {
-    type Job: Send + 'static;
+pub trait EventHandler: Send + Sync + 'static{
+    type Job: Send + Into<Vec<u8>> + 'static;
 
     fn on_open(&self, conn: &mut Connection) -> Action<Self::Job>;
 

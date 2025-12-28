@@ -1,9 +1,9 @@
 use crate::io_buffer::IOBuffer;
 use crate::socket_addr::NetworkAddress;
+use crate::socket::Socket;
 
 use bytes::{Buf, BytesMut};
 
-use crate::socket::Socket;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
 

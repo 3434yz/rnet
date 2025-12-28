@@ -20,6 +20,14 @@ const WAKE_TOKEN: Token = Token(usize::MAX - 1);
 const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 const EVENTS_CAP: usize = 1024;
 
+pub(crate) struct EventLoopBuilder {
+
+}
+
+pub(crate) struct EventLoopHandler {
+
+}
+
 pub struct EventLoop<H>
 where
     H: EventHandler,
@@ -29,7 +37,7 @@ where
     listener: Listener,
     local_addr: NetworkAddress,
     connections: Slab<Connection>,
-    handler: H,
+    handler: Arc<H>,
     buffer: Box<IOBuffer>,
     cache: BytesMut,
     request_sender: Sender<Request<H::Job>>,
@@ -44,7 +52,7 @@ where
     pub fn new(
         engine_id: usize,
         mut listener: Listener,
-        handler: H,
+        handler: Arc<H>,
         request_sender: Sender<Request<H::Job>>,
         response_receiver: Receiver<Response>,
     ) -> io::Result<Self> {
@@ -65,7 +73,7 @@ where
             listener,
             local_addr,
             connections: Slab::with_capacity(4096),
-            handler,
+            handler:handler.clone(),
             buffer,
             cache,
             request_sender,

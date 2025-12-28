@@ -9,7 +9,6 @@ use std::io::Write;
 
 #[derive(Clone, Copy)]
 struct MyHandler {
-    engine: Option<EngineHandler>,
 }
 
 impl EventHandler for MyHandler {
@@ -42,9 +41,7 @@ fn main() {
 
     let addrs = vec!["tcp://127.0.0.1:9000"];
     let net_socket_addrs = options.normalize(&addrs).unwrap();
-    let my_handler = MyHandler{
-        engine:None
-    };
+    let my_handler = MyHandler{};
 
     let (mut engine, _handler) = EngineBuilder::builder()
         .address(net_socket_addrs)

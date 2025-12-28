@@ -116,7 +116,7 @@ impl Options {
             parsed_addrs.push(net_addr);
         }
 
-        if self.reuse_port && (self.multicore || self.num_event_loop > 1) {
+        if !self.multicore && self.num_event_loop < 1 {
             eprintln!(
                 "rnet: SO_REUSEPORT is disabled on this platform for multicore mode, falling back to master-slave reactor."
             );
