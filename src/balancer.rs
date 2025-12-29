@@ -1,0 +1,78 @@
+use crate::event_loop::{ConnectionInitializer, EventLoopHandle};
+use crate::options::LoadBalancing;
+use std::sync::atomic::AtomicUsize;
+pub trait LoadBalancer: Send + Sync {
+    fn select(&self, workers: &[EventLoopHandle], new_conn: &ConnectionInitializer) -> usize;
+}
+
+pub enum Balancer {
+    RoundRobin(RoundRobin),
+    LeastConnections(LeastConnections),
+}
+
+impl Balancer {
+    pub fn new(option: LoadBalancing) -> Self {
+        match option {
+            LoadBalancing::RoundRobin => Self::RoundRobin(RoundRobin::default()),
+            LoadBalancing::LeastConnections => Self::LeastConnections(LeastConnections::default()),
+            LoadBalancing::SourceAddrHash => todo!(),
+        }
+    }
+
+    pub fn select(&self, workers: &[EventLoopHandle], new_conn: &ConnectionInitializer) -> usize {
+        match self {
+            Self::RoundRobin(inner) => inner.select(workers, new_conn),
+            Self::LeastConnections(inner) => inner.select(workers, new_conn),
+        }
+    }
+}
+
+pub struct RoundRobin {
+    next: AtomicUsize,
+}
+
+impl RoundRobin {
+    pub fn new() -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Default for RoundRobin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoadBalancer for RoundRobin {
+    fn select(&self, workers: &[EventLoopHandle], _new_conn: &ConnectionInitializer) -> usize {
+        if workers.is_empty() {
+            return 0;
+        }
+        let current = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        current % workers.len()
+    }
+}
+
+pub struct LeastConnections;
+
+impl Default for LeastConnections {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl LoadBalancer for LeastConnections {
+    fn select(&self, workers: &[EventLoopHandle], _new_conn: &ConnectionInitializer) -> usize {
+        if workers.is_empty() {
+            return 0;
+        }
+        workers
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, handle)| handle.connection_count())
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+}

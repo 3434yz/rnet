@@ -106,7 +106,6 @@ impl TryFrom<std::os::unix::net::SocketAddr> for NetworkAddress {
     type Error = Error;
 
     fn try_from(sys_addr: std::os::unix::net::SocketAddr) -> Result<Self, Self::Error> {
-        // 这里封装了脏活累活
         if let Some(path) = sys_addr.as_pathname() {
             Ok(NetworkAddress::Unix(path.to_path_buf()))
         } else {
@@ -115,6 +114,14 @@ impl TryFrom<std::os::unix::net::SocketAddr> for NetworkAddress {
                 "unix socket is not bound to a filesystem path (abstract or unnamed)",
             ))
         }
+    }
+}
+
+impl TryFrom<SocketAddr> for NetworkAddress {
+    type Error = Error;
+
+    fn try_from(value: SocketAddr) -> Result<Self, Self::Error> {
+        Ok(NetworkAddress::Tcp(value))
     }
 }
 

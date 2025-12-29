@@ -76,7 +76,7 @@ impl Listener {
     }
 
     pub fn local_addr(&self) -> io::Result<NetworkAddress> {
-        self.inner.local_addr()
+        Ok(self.addr.clone())
     }
 
     pub fn network(&self) -> &'static str {

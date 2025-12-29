@@ -1,6 +1,6 @@
 use crate::io_buffer::IOBuffer;
-use crate::socket_addr::NetworkAddress;
 use crate::socket::Socket;
+use crate::socket_addr::NetworkAddress;
 
 use bytes::{Buf, BytesMut};
 
@@ -36,7 +36,6 @@ impl Connection {
         }
     }
 
-    /// 计算 buffer 和 in_buf 总共有多少数据
     pub fn remaining(&self) -> usize {
         unsafe {
             let buffer = self.buf_ptr.as_ref();

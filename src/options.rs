@@ -1,6 +1,10 @@
+use crate::socket_addr::NetworkAddress;
+
+use core_affinity::CoreId;
+
+use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
-use crate::socket_addr::NetworkAddress;
 
 const DEFAULT_BUFFER_SIZE: usize = 1024;
 const MAX_STREAM_BUFFER_CAP: usize = 64 * 1024;
@@ -40,7 +44,6 @@ pub struct Options {
     pub reuse_port: bool,
     // pub multicast_interface_index: u32,
     pub bind_to_device: String,
-    pub multicore: bool,
     pub num_event_loop: usize,
     pub read_buffer_cap: usize,
     pub write_buffer_cap: usize,
@@ -67,7 +70,6 @@ impl Default for Options {
             reuse_port: false,
             // multicast_interface_index: 0,
             bind_to_device: String::new(),
-            multicore: false,
             num_event_loop: 0,
             read_buffer_cap: MAX_STREAM_BUFFER_CAP,
             write_buffer_cap: MAX_STREAM_BUFFER_CAP,
@@ -116,13 +118,6 @@ impl Options {
             parsed_addrs.push(net_addr);
         }
 
-        if !self.multicore && self.num_event_loop < 1 {
-            eprintln!(
-                "rnet: SO_REUSEPORT is disabled on this platform for multicore mode, falling back to master-slave reactor."
-            );
-            self.reuse_port = false;
-        }
-
         if self.reuse_port && has_unix {
             self.reuse_port = false;
         }
@@ -144,7 +139,6 @@ pub struct OptionsBuilder {
     reuse_port: Option<bool>,
     // multicast_interface_index: Option<u32>,
     bind_to_device: Option<String>,
-    multicore: Option<bool>,
     num_event_loop: Option<usize>,
     read_buffer_cap: Option<usize>,
     write_buffer_cap: Option<usize>,
@@ -183,9 +177,6 @@ impl OptionsBuilder {
         // }
         if let Some(v) = self.bind_to_device {
             opts.bind_to_device = v;
-        }
-        if let Some(v) = self.multicore {
-            opts.multicore = v;
         }
         if let Some(v) = self.num_event_loop {
             opts.num_event_loop = v;
@@ -232,7 +223,7 @@ impl OptionsBuilder {
 
         if opts.edge_triggered_io_chunk > 0 {
             opts.edge_triggered_io_chunk = ceil_to_power_of_two(opts.edge_triggered_io_chunk);
-        } else  {
+        } else {
             opts.edge_triggered_io_chunk = 1 << 20;
         }
 
@@ -263,10 +254,6 @@ impl OptionsBuilder {
     // }
     pub fn bind_to_device(mut self, val: String) -> Self {
         self.bind_to_device = Some(val);
-        self
-    }
-    pub fn multicore(mut self, val: bool) -> Self {
-        self.multicore = Some(val);
         self
     }
     pub fn num_event_loop(mut self, val: usize) -> Self {
@@ -341,10 +328,139 @@ fn ceil_to_power_of_two(n: usize) -> usize {
     if n <= 2 { 2 } else { n.next_power_of_two() }
 }
 
+pub fn get_core_ids(limit: Option<usize>) -> Vec<CoreId> {
+    let all_cores = core_affinity::get_core_ids().unwrap_or_default();
 
-// 单元测试
+    if limit.is_none() {
+        return all_cores;
+    }
+
+    let target_count = limit.unwrap();
+    if target_count == 0 {
+        return all_cores;
+    }
+
+    if !cfg!(target_os = "linux") {
+        return all_cores.into_iter().take(target_count).collect();
+    }
+
+    let mut selected_cores = Vec::with_capacity(target_count);
+    let mut seen_physical_keys = HashSet::new();
+
+    for core in all_cores {
+        // 如果已经凑够了数量，立即停止
+        if selected_cores.len() >= target_count {
+            break;
+        }
+
+        // 获取物理拓扑指纹
+        let key = get_linux_topology_key(core.id);
+
+        if seen_physical_keys.insert(key) {
+            selected_cores.push(core);
+        }
+    }
+
+    selected_cores
+}
+
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct TopoKey {
+    socket: String,
+    core: String,
+}
+
+#[cfg(target_os = "linux")]
+fn get_linux_topology_key(cpu_id: usize) -> TopoKey {
+    use std::fs;
+    use std::path::Path;
+
+    let base = format!("/sys/devices/system/cpu/cpu{}/topology", cpu_id);
+    let path = Path::new(&base);
+
+    let socket = fs::read_to_string(path.join("physical_package_id"))
+        .unwrap_or_else(|_| "0".to_string())
+        .trim()
+        .to_string();
+
+    let core = fs::read_to_string(path.join("core_id"))
+        .unwrap_or_else(|_| cpu_id.to_string())
+        .trim()
+        .to_string();
+
+    TopoKey { socket, core }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_linux_topology_key(cpu_id: usize) -> TopoKey {
+    TopoKey {
+        socket: "0".to_string(),
+        core: cpu_id.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_limit_none_returns_all() {
+        let all_system_cores = core_affinity::get_core_ids().unwrap();
+        let result = get_core_ids(None);
+
+        println!(
+            "Test None: System has {} cores, got {}",
+            all_system_cores.len(),
+            result.len()
+        );
+        assert_eq!(result.len(), all_system_cores.len());
+    }
+
+    #[test]
+    fn test_limit_some_filters_topology() {
+        let target = 4;
+        let result = get_core_ids(Some(target));
+
+        println!("Test Some({}): Got {:?}", target, result);
+
+        assert!(result.len() <= target);
+
+        if cfg!(target_os = "linux") {
+            let mut seen_phys = HashSet::new();
+            for core in &result {
+                let key = get_linux_topology_key(core.id);
+                // 如果插入失败，说明结果里包含了同一个物理核的两个线程 -> 测试失败
+                if !seen_phys.insert(key) {
+                    panic!(
+                        "Test Failed: Found duplicate physical core usage in result: {:?}",
+                        core
+                    );
+                }
+            }
+            println!(
+                "Test Some({}): Topology check passed. All cores are physically distinct.",
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn test_limit_overflow() {
+        let huge_limit = 1024;
+        let result = get_core_ids(Some(huge_limit));
+
+        println!(
+            "Test Overflow: Requested {}, got {}",
+            huge_limit,
+            result.len()
+        );
+        assert!(result.len() > 0);
+        assert!(result.len() <= core_affinity::get_core_ids().unwrap().len());
+    }
+}
+
+#[cfg(test)]
+mod test_option {
     use super::*;
     #[test]
     fn test_buffer_cap_normalization() {
@@ -375,17 +491,13 @@ mod tests {
         let opts = Options::builder().build();
         assert_eq!(opts.edge_triggered_io_chunk, 1024 * 1024);
 
-        let opts = Options::builder()
-            .edge_triggered_io_chunk(100)
-            .build();
+        let opts = Options::builder().edge_triggered_io_chunk(100).build();
         assert_eq!(opts.edge_triggered_io_chunk, 128);
     }
 
     #[test]
     fn test_normalize_udp() {
-        let mut opts = Options::builder()
-            .reuse_port(false)
-            .build();
+        let mut opts = Options::builder().reuse_port(false).build();
 
         opts.normalize(&["udp://127.0.0.1:8080"]).unwrap();
 
@@ -395,9 +507,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_normalize_unix() {
-        let mut opts = Options::builder()
-            .reuse_port(true)
-            .build();
+        let mut opts = Options::builder().reuse_port(true).build();
 
         opts.normalize(&["unix:///tmp/test.sock"]).unwrap();
 
@@ -422,13 +532,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_multicore_reuse_port_linux() {
-        let mut opts = Options::builder().multicore(true).reuse_port(true).build();
-        opts.normalize(&["tcp://:8080"]).unwrap();
-        assert_eq!(opts.reuse_port, false);
-    }
-
-    #[test]
     fn test_ceil_to_power_of_two() {
         assert_eq!(ceil_to_power_of_two(0), 2);
         assert_eq!(ceil_to_power_of_two(1), 2);
@@ -439,4 +542,7 @@ mod tests {
         assert_eq!(ceil_to_power_of_two(1024), 1024);
         assert_eq!(ceil_to_power_of_two(1025), 2048);
     }
+
+    #[test]
+    fn get_isolated_cores_from_affinity() {}
 }

@@ -9,13 +9,14 @@ use std::io::Write;
 
 #[derive(Clone, Copy)]
 struct MyHandler {
+    engine: Option<EngineHandler>,
 }
 
 impl EventHandler for MyHandler {
     type Job = Vec<u8>;
 
     fn on_open(&self, _conn: &mut Connection) -> Action<Self::Job> {
-        println!("New Connect");
+        // println!("New Connect");
         Action::None
     }
 
@@ -27,25 +28,27 @@ impl EventHandler for MyHandler {
     }
 
     fn on_close(&self, _ctx: &mut Context) -> Action<Self::Job> {
-        println!("Close Connect");
+        // println!("Close Connect");
         Action::None
     }
 }
 
 fn main() {
     let mut options = Options::builder()
-        .reuse_port(true)
+        // .reuse_port(true)
         .reuse_addr(true)
-        .multicore(true)
+        .num_event_loop(8)
         .build();
 
     let addrs = vec!["tcp://127.0.0.1:9000"];
     let net_socket_addrs = options.normalize(&addrs).unwrap();
-    let my_handler = MyHandler{};
 
-    let (mut engine, _handler) = EngineBuilder::builder()
-        .address(net_socket_addrs)
-        .build::<MyHandler>(options, my_handler);
+    let (mut engine, _handler_copy) =
+        EngineBuilder::builder()
+            .address(net_socket_addrs)
+            .build(options, |engine_handler| MyHandler {
+                engine: Some(engine_handler),
+            });
 
     engine.run().expect("run failed");
 }
