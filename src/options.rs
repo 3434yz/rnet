@@ -55,7 +55,7 @@ pub struct Options {
     pub tcp_no_delay: TcpSocketOpt,
     pub socket_recv_buffer: usize,
     pub socket_send_buffer: usize,
-    pub edge_triggered_io_chunk: usize,
+    pub max_batch_size: usize,
 
     // === 日志相关 ===
     pub log_path: Option<String>,
@@ -81,7 +81,7 @@ impl Default for Options {
             tcp_no_delay: TcpSocketOpt::NoDelay,
             socket_recv_buffer: 0,
             socket_send_buffer: 0,
-            edge_triggered_io_chunk: 0,
+            max_batch_size: 0,
 
             log_path: None,
             log_level: Level::default(),
@@ -212,7 +212,7 @@ impl OptionsBuilder {
             opts.socket_send_buffer = v;
         }
         if let Some(v) = self.edge_triggered_io_chunk {
-            opts.edge_triggered_io_chunk = v;
+            opts.max_batch_size = v;
         }
         if let Some(v) = self.log_path {
             opts.log_path = Some(v);
@@ -221,10 +221,10 @@ impl OptionsBuilder {
             opts.log_level = v;
         }
 
-        if opts.edge_triggered_io_chunk > 0 {
-            opts.edge_triggered_io_chunk = ceil_to_power_of_two(opts.edge_triggered_io_chunk);
+        if opts.max_batch_size > 0 {
+            opts.max_batch_size = ceil_to_power_of_two(opts.max_batch_size);
         } else {
-            opts.edge_triggered_io_chunk = 1 << 20;
+            opts.max_batch_size = 1 << 20;
         }
 
         opts.read_buffer_cap = normalize_buffer_size(opts.read_buffer_cap);
@@ -489,10 +489,10 @@ mod test_option {
     #[test]
     fn test_et_chunk_normalization() {
         let opts = Options::builder().build();
-        assert_eq!(opts.edge_triggered_io_chunk, 1024 * 1024);
+        assert_eq!(opts.max_batch_size, 1024 * 1024);
 
         let opts = Options::builder().edge_triggered_io_chunk(100).build();
-        assert_eq!(opts.edge_triggered_io_chunk, 128);
+        assert_eq!(opts.max_batch_size, 128);
     }
 
     #[test]

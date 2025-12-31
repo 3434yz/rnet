@@ -208,7 +208,7 @@ where
         for p in pending {
             let mut el = p.el;
             let core = p.core;
-            let idx = el.idx;
+            let idx = el.loop_id;
             let t = thread::spawn(move || {
                 if !core_affinity::set_for_current(core) {
                     eprintln!("EventLoop {} failed to pin", idx);

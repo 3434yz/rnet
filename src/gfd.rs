@@ -13,12 +13,12 @@ pub struct Gfd {
 
 impl Gfd {
     #[inline]
-    pub fn new(fd: i64, loop_id: u8, slab_index: usize) -> Self {
-        debug_assert!(slab_index < (1 << 24), "Slab index overflow");
+    pub fn new(fd: i64, loop_id: u8, token: usize) -> Self {
+        debug_assert!(token < (1 << 24), "Slab index overflow");
 
         let seq = MONO_SEQ.fetch_add(1, Ordering::Relaxed);
 
-        let index_info = ((loop_id as u32) << 24) | (slab_index as u32 & 0xFFFFFF);
+        let index_info = ((loop_id as u32) << 24) | (token as u32 & 0xFFFFFF);
 
         Self {
             fd,
