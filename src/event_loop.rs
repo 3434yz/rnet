@@ -1,7 +1,7 @@
 use crate::command::{Request, Response};
 use crate::connection::Connection;
 use crate::gfd::Gfd;
-use crate::handler::{Action, Context, EventHandler};
+use crate::handler::{Action, EventHandler};
 use crate::io_buffer::IOBuffer;
 use crate::listener::Listener;
 use crate::options::Options;
@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const SERVER_TOKEN: Token = Token(usize::MAX);
@@ -41,11 +41,37 @@ pub struct ConnectionInitializer {
 
 pub(crate) struct EventLoopBuilder {}
 
+#[derive(Debug)]
+pub struct EventLoopWaker {
+    waker: Waker,
+    awoken: AtomicBool,
+}
+
+impl EventLoopWaker {
+    pub fn new(waker: Waker) -> Self {
+        Self {
+            waker,
+            awoken: AtomicBool::new(false),
+        }
+    }
+
+    pub fn wake(&self) -> io::Result<()> {
+        if !self.awoken.swap(true, Ordering::SeqCst) {
+            self.waker.wake()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reset(&self) {
+        self.awoken.store(false, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EventLoopHandle {
     pub idx: usize,
     pub sender: Sender<ConnectionInitializer>,
-    pub waker: Arc<Waker>,
+    pub waker: Arc<EventLoopWaker>,
     pub conn_count: Arc<AtomicUsize>,
 }
 
@@ -53,7 +79,7 @@ impl EventLoopHandle {
     pub fn new(
         idx: usize,
         sender: Sender<ConnectionInitializer>,
-        waker: Arc<Waker>,
+        waker: Arc<EventLoopWaker>,
         conn_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -75,6 +101,7 @@ where
 {
     pub loop_id: u8,
     poll: Poll,
+    waker: Arc<EventLoopWaker>,
     listener: Option<Listener>,
     options: Arc<Options>,
     connections: Slab<Connection>,
@@ -84,7 +111,6 @@ where
     request_sender: Sender<Request<H::Job>>,
     response_receiver: Receiver<Response>,
     conn_receiver: Option<Receiver<ConnectionInitializer>>,
-    waker: Arc<Waker>,
     conn_count: Option<Arc<AtomicUsize>>,
     resume_queue: VecDeque<usize>,
 }
@@ -105,7 +131,7 @@ where
     ) -> io::Result<Self> {
         let poll = Poll::new()?;
         let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
-        let waker = Arc::new(waker);
+        let waker = Arc::new(EventLoopWaker::new(waker));
 
         if let Some(listener) = listener.as_mut() {
             poll.registry()
@@ -148,7 +174,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn get_waker(&self) -> Arc<Waker> {
+    pub(crate) fn get_waker(&self) -> Arc<EventLoopWaker> {
         self.waker.clone()
     }
 
@@ -172,6 +198,7 @@ where
                 match event.token() {
                     SERVER_TOKEN => self.accept_loop()?,
                     WAKE_TOKEN => {
+                        self.waker.reset();
                         self.process_responses()?;
                         self.process_new_connections()?;
                     }
@@ -369,12 +396,7 @@ where
             return Ok(());
         }
         let conn = self.connections.get_mut(key).unwrap();
-        let mut ctx = Context {
-            local_addr: conn.local_addr.clone(),
-            peer_addr: conn.peer_addr.clone(),
-            out_buf: &mut conn.out_buf,
-        };
-        self.handler.on_close(&mut ctx);
+        self.handler.on_close(conn);
         let _ = self.poll.registry().deregister(&mut conn.socket);
         self.connections.remove(key);
 

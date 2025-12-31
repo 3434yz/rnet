@@ -1,6 +1,6 @@
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
-use rnet::handler::{Action, Context, EventHandler};
+use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 
 use bytes::BytesMut;
@@ -27,7 +27,7 @@ impl EventHandler for MyHandler {
         Action::None
     }
 
-    fn on_close(&self, _ctx: &mut Context) -> Action<Self::Job> {
+    fn on_close(&self, _ctx: &mut Connection) -> Action<Self::Job> {
         // println!("Close Connect");
         Action::None
     }

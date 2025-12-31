@@ -1,6 +1,6 @@
 use crate::acceptor::Acceptor;
 use crate::balancer::Balancer;
-use crate::event_loop::{ConnectionInitializer, EventLoop, EventLoopHandle};
+use crate::event_loop::{ConnectionInitializer, EventLoop, EventLoopHandle, EventLoopWaker};
 use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
@@ -161,7 +161,7 @@ where
             el: EventLoop<H>,
             core: core_affinity::CoreId,
             resp_tx: crossbeam::channel::Sender<crate::command::Response>,
-            waker: Arc<mio::Waker>,
+            waker: Arc<EventLoopWaker>,
         }
 
         let mut pending = Vec::new();
@@ -243,7 +243,7 @@ where
 mod tests {
     use crate::connection::Connection;
     use crate::engine::{EngineBuilder, EngineHandler};
-    use crate::handler::{Action, Context, EventHandler};
+    use crate::handler::{Action, EventHandler};
     use crate::options::Options;
     use bytes::BytesMut;
 
@@ -264,7 +264,7 @@ mod tests {
             Action::None
         }
 
-        fn on_close(&self, _ctx: &mut Context) -> Action<Self::Job> {
+        fn on_close(&self, _ctx: &mut Connection) -> Action<Self::Job> {
             println!("Close Connect");
             Action::None
         }

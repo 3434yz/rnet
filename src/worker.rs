@@ -1,13 +1,13 @@
 use crate::command::{Request, Response};
+use crate::event_loop::EventLoopWaker;
 use crossbeam::channel::{Receiver, Sender};
-use mio::Waker;
 use std::sync::Arc;
 use std::thread;
 
 pub fn start_worker<J, F>(
     id: usize,
     task_receiver: Receiver<Request<J>>,
-    engine_registry: Vec<(Sender<Response>, Arc<Waker>)>,
+    engine_registry: Vec<(Sender<Response>, Arc<EventLoopWaker>)>,
     processor: F,
 ) where
     J: Send + 'static,
