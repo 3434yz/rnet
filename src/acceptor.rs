@@ -65,15 +65,14 @@ impl Acceptor {
                 }
             };
 
-            let init = ConnectionInitializer {
-                socket,
-                peer_addr,
-                local_addr: local_addr.clone(),
-            };
-
-            let idx = self.balancer.select(&self.workers, &init);
+            let idx = self.balancer.select(&self.workers);
 
             if let Some(handle) = self.workers.get(idx) {
+                let init = ConnectionInitializer {
+                    socket,
+                    peer_addr,
+                    local_addr: local_addr.clone(),
+                };
                 if let Err(_e) = handle.sender.send(init) {
                     eprintln!("Worker {} queue full, dropping connection", idx);
                     continue;

@@ -1,4 +1,6 @@
+use crate::gfd::Gfd;
 use crate::io_buffer::IOBuffer;
+use crate::options::Options;
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
@@ -6,9 +8,10 @@ use bytes::{Buf, BytesMut};
 
 use std::io::{Read, Write};
 use std::ptr::NonNull;
+use std::sync::Arc;
 
-// TODO 增加 GFD
 pub struct Connection {
+    pub(crate) gfd: Gfd,
     pub(crate) socket: Socket,
     pub(crate) local_addr: NetworkAddress,
     pub(crate) peer_addr: NetworkAddress,
@@ -20,18 +23,21 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(
+        gfd: Gfd,
         socket: Socket,
+        options: Arc<Options>,
         local_addr: NetworkAddress,
         peer_addr: NetworkAddress,
         buf_ptr: NonNull<IOBuffer>,
     ) -> Self {
         Self {
+            gfd,
             socket,
             local_addr,
             peer_addr,
             closed: false,
-            in_buf: BytesMut::with_capacity(4096),
-            out_buf: BytesMut::with_capacity(4096),
+            in_buf: BytesMut::with_capacity(options.read_buffer_cap),
+            out_buf: BytesMut::with_capacity(options.write_buffer_cap),
             buf_ptr,
         }
     }

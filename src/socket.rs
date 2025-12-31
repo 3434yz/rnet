@@ -13,6 +13,28 @@ pub enum Socket {
 }
 
 impl Socket {
+    pub(crate) fn fd(&self) -> i64 {
+        match self {
+            Self::Tcp(s) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    s.as_raw_fd() as i64
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::AsRawSocket;
+                    s.as_raw_socket() as i64
+                }
+            }
+            #[cfg(unix)]
+            Self::Unix(s) => {
+                use std::os::unix::io::AsRawFd;
+                s.as_raw_fd() as i64
+            }
+        }
+    }
+
     pub(crate) fn local_addr(&self) -> io::Result<NetworkAddress> {
         match self {
             Self::Tcp(s) => s.local_addr().map(NetworkAddress::Tcp),

@@ -1,8 +1,8 @@
-use crate::event_loop::{ConnectionInitializer, EventLoopHandle};
+use crate::event_loop::EventLoopHandle;
 use crate::options::LoadBalancing;
 use std::sync::atomic::AtomicUsize;
 pub trait LoadBalancer: Send + Sync {
-    fn select(&self, workers: &[EventLoopHandle], new_conn: &ConnectionInitializer) -> usize;
+    fn select(&self, workers: &[EventLoopHandle]) -> usize;
 }
 
 pub enum Balancer {
@@ -19,10 +19,10 @@ impl Balancer {
         }
     }
 
-    pub fn select(&self, workers: &[EventLoopHandle], new_conn: &ConnectionInitializer) -> usize {
+    pub fn select(&self, workers: &[EventLoopHandle]) -> usize {
         match self {
-            Self::RoundRobin(inner) => inner.select(workers, new_conn),
-            Self::LeastConnections(inner) => inner.select(workers, new_conn),
+            Self::RoundRobin(inner) => inner.select(workers),
+            Self::LeastConnections(inner) => inner.select(workers),
         }
     }
 }
@@ -46,7 +46,7 @@ impl Default for RoundRobin {
 }
 
 impl LoadBalancer for RoundRobin {
-    fn select(&self, workers: &[EventLoopHandle], _new_conn: &ConnectionInitializer) -> usize {
+    fn select(&self, workers: &[EventLoopHandle]) -> usize {
         if workers.is_empty() {
             return 0;
         }
@@ -64,7 +64,7 @@ impl Default for LeastConnections {
 }
 
 impl LoadBalancer for LeastConnections {
-    fn select(&self, workers: &[EventLoopHandle], _new_conn: &ConnectionInitializer) -> usize {
+    fn select(&self, workers: &[EventLoopHandle]) -> usize {
         if workers.is_empty() {
             return 0;
         }

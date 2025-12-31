@@ -1,8 +1,10 @@
-use crate::command::{Request, Response, pack_session_id, unpack_session_id};
+use crate::command::{Request, Response};
 use crate::connection::Connection;
+use crate::gfd::Gfd;
 use crate::handler::{Action, Context, EventHandler};
 use crate::io_buffer::IOBuffer;
 use crate::listener::Listener;
+use crate::options::Options;
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
@@ -63,9 +65,10 @@ pub(crate) struct EventLoop<H>
 where
     H: EventHandler,
 {
-    pub idx: usize,
+    pub idx: u8,
     poll: Poll,
     listener: Option<Listener>,
+    options: Arc<Options>,
     connections: Slab<Connection>,
     handler: Arc<H>,
     buffer: Box<IOBuffer>,
@@ -82,8 +85,9 @@ where
     H: EventHandler,
 {
     pub(crate) fn new(
-        idx: usize,
+        idx: u8,
         mut listener: Option<Listener>,
+        options: Arc<Options>,
         handler: Arc<H>,
         conn_receiver: Option<Receiver<ConnectionInitializer>>,
         request_sender: Sender<Request<H::Job>>,
@@ -115,6 +119,7 @@ where
             conn_receiver,
             waker,
             conn_count,
+            options,
         })
     }
 
@@ -205,21 +210,25 @@ where
 
     fn process_responses(&mut self) -> io::Result<()> {
         while let Ok(response) = self.response_receiver.try_recv() {
-            let (engine_id, token_usize) = unpack_session_id(response.session_id);
-
-            if engine_id != self.idx {
-                eprintln!("Error: Received response for wrong engine {}", engine_id);
+            let gfd = response.gfd;
+            let loop_idx = gfd.event_loop_index();
+            if loop_idx != self.idx as usize {
+                eprintln!("Error: Received response for wrong engine {}", loop_idx);
                 continue;
             }
-
-            if let Some(conn) = self.connections.get_mut(token_usize) {
+            let token = gfd.slab_index();
+            if let Some(conn) = self.connections.get_mut(token) {
+                if conn.gfd != gfd {
+                    // Connection mismatch (ABA problem), ignore stale response
+                    continue;
+                }
                 let _ = conn.write(&response.data);
             } else {
                 continue;
             }
 
-            if self.write_socket(token_usize)? {
-                self.close_connection(token_usize)?;
+            if self.write_socket(token)? {
+                self.close_connection(token)?;
             }
         }
         Ok(())
@@ -244,7 +253,15 @@ where
 
         let raw_ptr = self.buffer.as_mut() as *mut IOBuffer;
         let ptr = NonNull::new(raw_ptr).expect("create ptr error");
-        let mut conn = Connection::new(socket, local_addr, peer_addr, ptr);
+        let gfd = Gfd::new(socket.fd(), self.idx, token.0);
+        let mut conn = Connection::new(
+            gfd,
+            socket,
+            self.options.clone(),
+            local_addr,
+            peer_addr,
+            ptr,
+        );
         match self.handler.on_open(&mut conn) {
             Action::Close => {
                 // Drop conn
@@ -301,7 +318,7 @@ where
                         Action::Close => closed = true,
                         Action::Publish(job) => {
                             let req = Request {
-                                session_id: pack_session_id(self.idx, key),
+                                gfd: conn.gfd.clone(),
                                 job,
                             };
                             let _ = self.request_sender.send(req);

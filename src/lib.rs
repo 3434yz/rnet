@@ -5,6 +5,7 @@ pub mod command;
 pub mod connection;
 pub mod engine;
 pub mod event_loop;
+pub mod gfd;
 pub mod handler;
 pub mod io_buffer;
 pub mod listener;

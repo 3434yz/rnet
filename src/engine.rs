@@ -7,7 +7,6 @@ use crate::options::{Options, get_core_ids};
 use crate::socket_addr::NetworkAddress;
 use crate::worker::start_worker;
 
-use std::cmp::min;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::{io, thread};
@@ -107,8 +106,9 @@ where
             let conn_count = Arc::new(AtomicUsize::new(0));
 
             let mut event_loop = EventLoop::new(
-                idx,
+                idx as u8,
                 None,
+                self.options.clone(),
                 handler.clone(),
                 Some(conn_rx),
                 req_tx.clone(),
@@ -119,7 +119,6 @@ where
             let handle = EventLoopHandle::new(idx, conn_tx, event_loop.get_waker(), conn_count);
             handles.push(handle);
 
-            // 2.6 启动 IO 线程
             let t = thread::spawn(move || {
                 if !core_affinity::set_for_current(core_id) {
                     eprintln!("EventLoop {} failed to pin to core", idx);
@@ -153,7 +152,7 @@ where
 
     fn run_reuse_port(&mut self, worker_cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
         println!("Engine runing kernel lb");
-        let (req_tx, req_rx) = crossbeam::channel::unbounded();
+        let (request_sender, req_rx) = crossbeam::channel::unbounded();
         let mut threads = Vec::new();
 
         let mut registry = Vec::new();
@@ -168,17 +167,18 @@ where
         let mut pending = Vec::new();
 
         for (idx, core_id) in worker_cores.into_iter().enumerate() {
-            let (resp_tx, resp_rx) = crossbeam::channel::unbounded();
+            let (resp_tx, response_receiver) = crossbeam::channel::unbounded();
 
             let listener = Listener::bind(self.address[0].clone(), self.options.clone())?;
 
             let event_loop = EventLoop::new(
-                idx,
+                idx as u8,
                 Some(listener),
+                self.options.clone(),
                 handler.clone(),
                 None,
-                req_tx.clone(),
-                resp_rx,
+                request_sender.clone(),
+                response_receiver,
                 None,
             )?;
 
