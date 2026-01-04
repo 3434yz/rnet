@@ -1,4 +1,4 @@
-use crate::command::{Request, Response};
+use crate::command::Command;
 use crate::connection::Connection;
 use crate::gfd::Gfd;
 use crate::handler::{Action, EventHandler};
@@ -14,7 +14,6 @@ use mio::event::Event;
 use mio::{Events, Interest, Poll, Token, Waker};
 use slab::Slab;
 
-use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -29,14 +28,7 @@ const EVENTS_CAP: usize = 1024;
 enum IoStatus {
     Completed,
     Yield,
-    Closed,
-}
-
-#[derive(Debug)]
-pub struct ConnectionInitializer {
-    pub socket: Socket,
-    pub peer_addr: NetworkAddress,
-    pub local_addr: NetworkAddress,
+    Closed(bool),
 }
 
 pub(crate) struct EventLoopBuilder {}
@@ -68,17 +60,20 @@ impl EventLoopWaker {
 }
 
 #[derive(Clone, Debug)]
-pub struct EventLoopHandle {
+pub struct EventLoopHandle<H: EventHandler> {
     pub idx: usize,
-    pub sender: Sender<ConnectionInitializer>,
+    pub sender: Sender<Command<H::Job>>,
     pub waker: Arc<EventLoopWaker>,
     pub conn_count: Arc<AtomicUsize>,
 }
 
-impl EventLoopHandle {
+impl<H> EventLoopHandle<H>
+where
+    H: EventHandler,
+{
     pub fn new(
         idx: usize,
-        sender: Sender<ConnectionInitializer>,
+        sender: Sender<Command<H::Job>>,
         waker: Arc<EventLoopWaker>,
         conn_count: Arc<AtomicUsize>,
     ) -> Self {
@@ -108,11 +103,10 @@ where
     handler: Arc<H>,
     buffer: Box<IOBuffer>,
     cache: BytesMut,
-    request_sender: Sender<Request<H::Job>>,
-    response_receiver: Receiver<Response>,
-    conn_receiver: Option<Receiver<ConnectionInitializer>>,
-    conn_count: Option<Arc<AtomicUsize>>,
-    resume_queue: VecDeque<usize>,
+    job_sender: Sender<Command<H::Job>>,
+    inner_sender: Sender<Command<H::Job>>,
+    inner_receiver: Receiver<Command<H::Job>>,
+    conn_count: Arc<AtomicUsize>,
 }
 
 impl<H> EventLoop<H>
@@ -124,10 +118,10 @@ where
         mut listener: Option<Listener>,
         options: Arc<Options>,
         handler: Arc<H>,
-        conn_receiver: Option<Receiver<ConnectionInitializer>>,
-        request_sender: Sender<Request<H::Job>>,
-        response_receiver: Receiver<Response>,
-        conn_count: Option<Arc<AtomicUsize>>,
+        job_sender: Sender<Command<H::Job>>,
+        inner_sender: Sender<Command<H::Job>>,
+        inner_receiver: Receiver<Command<H::Job>>,
+        conn_count: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poll = Poll::new()?;
         let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
@@ -141,7 +135,6 @@ where
         let buffer = Box::new(IOBuffer::new(DEFAULT_BUF_SIZE));
         let cache = BytesMut::with_capacity(DEFAULT_BUF_SIZE);
         let connections = Slab::with_capacity(4096);
-        let resume_queue = VecDeque::with_capacity(1024);
 
         Ok(Self {
             loop_id: idx,
@@ -151,13 +144,12 @@ where
             handler,
             buffer,
             cache,
-            request_sender,
-            response_receiver,
-            conn_receiver,
+            job_sender,
+            inner_sender,
+            inner_receiver,
             waker,
             conn_count,
             options,
-            resume_queue,
         })
     }
 
@@ -181,7 +173,7 @@ where
     pub(crate) fn run(&mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(EVENTS_CAP);
         loop {
-            let timeout = if self.resume_queue.is_empty() {
+            let timeout = if self.inner_receiver.is_empty() {
                 None
             } else {
                 Some(Duration::ZERO)
@@ -199,44 +191,62 @@ where
                     SERVER_TOKEN => self.accept_loop()?,
                     WAKE_TOKEN => {
                         self.waker.reset();
-                        self.process_responses()?;
-                        self.process_new_connections()?;
+                        self.process_command()?
                     }
                     token => self.process_io(token, &event)?,
-                }
-            }
-
-            let pending_count = self.resume_queue.len();
-            for _ in 0..pending_count {
-                if let Some(token_idx) = self.resume_queue.pop_front() {
-                    if self.process_socket_resume(token_idx)? {
-                        self.close_connection(token_idx)?;
-                    }
                 }
             }
         }
     }
 
-    fn process_socket_resume(&mut self, key: usize) -> io::Result<bool> {
-        let mut yield_flag = false;
-        match self.read_socket(key)? {
-            IoStatus::Closed => return Ok(true),
-            IoStatus::Yield => yield_flag = true,
-            IoStatus::Completed => {}
-        }
+    fn process_command(&mut self) -> io::Result<()> {
+        loop {
+            match self.inner_receiver.try_recv() {
+                Ok(c) => match c {
+                    Command::JobReq(gfd, job) => {
+                        let req = Command::JobReq(gfd, job);
+                        let _ = self.job_sender.send(req); // todo handler error
+                    }
+                    Command::JobResp(gfd, data) => {
+                        let loop_idx = gfd.event_loop_index();
+                        if loop_idx != self.loop_id as usize {
+                            eprintln!("Error: Received response for wrong engine {}", loop_idx);
+                            continue;
+                        }
+                        let token = gfd.slab_index();
+                        if let Some(conn) = self.connections.get_mut(token) {
+                            if conn.gfd != gfd {
+                                continue;
+                            }
+                            let _ = conn.write(&data);
+                        } else {
+                            continue;
+                        }
 
-        match self.write_socket(key)? {
-            IoStatus::Closed => return Ok(true),
-            IoStatus::Yield => yield_flag = true,
-            IoStatus::Completed => {}
+                        self.write_socket(token)?;
+                        self.reregister(token)?;
+                    }
+                    Command::Register(socket, local_addr, peer_addr) => {
+                        self.register(socket, local_addr, peer_addr)?
+                    }
+                    Command::Close(key) => self.close_connection(key, true)?,
+                    Command::Read(key) => {
+                        if self.read_socket(key)? {
+                            let _ = self.inner_sender.send(Command::Read(key));
+                        }
+                    }
+                    Command::Write(key) => {
+                        if self.write_socket(key)? {
+                            let _ = self.inner_sender.send(Command::Write(key));
+                        }
+                    }
+                    Command::Wake() => todo!(),
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
         }
-
-        if yield_flag {
-            self.resume_queue.push_back(key);
-        } else {
-            self.reregister(key)?;
-        }
-        Ok(false)
+        Ok(())
     }
 
     fn accept_loop(&mut self) -> io::Result<()> {
@@ -261,89 +271,24 @@ where
         Ok(())
     }
 
-    fn process_new_connections(&mut self) -> io::Result<()> {
-        let receiver = match &self.conn_receiver {
-            Some(r) => r.clone(),
-            None => return Ok(()),
-        };
-
-        loop {
-            let init = match receiver.try_recv() {
-                Ok(s) => s,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            };
-
-            self.register(init.socket, init.local_addr, init.peer_addr)?;
-        }
-        Ok(())
-    }
-
     fn process_io(&mut self, token: Token, event: &Event) -> io::Result<()> {
         let key = token.into();
-        let mut yield_flag = false;
 
-        if event.is_writable() {
-            match self.write_socket(key)? {
-                IoStatus::Closed => {
-                    self.close_connection(key)?;
-                    return Ok(());
-                }
-                IoStatus::Yield => {
-                    yield_flag = true;
-                }
-                IoStatus::Completed => {}
-            }
+        if (event.is_error() || event.is_read_closed())
+            && (!event.is_readable() && !event.is_writable())
+        {
+            self.close_connection(key, false)?;
+            return Ok(());
         }
 
-        if event.is_readable() {
-            match self.read_socket(key)? {
-                IoStatus::Closed => {
-                    self.close_connection(key)?;
-                    return Ok(());
-                }
-                IoStatus::Yield => {
-                    yield_flag = true;
-                }
-                IoStatus::Completed => {}
-            }
+        if event.is_error() || event.is_writable() {
+            self.write_socket(key)?;
         }
 
-        if yield_flag {
-            self.resume_queue.push_back(key);
-        } else {
-            self.reregister(key)?;
+        if event.is_error() || event.is_readable() {
+            self.read_socket(key)?;
         }
 
-        Ok(())
-    }
-
-    fn process_responses(&mut self) -> io::Result<()> {
-        while let Ok(response) = self.response_receiver.try_recv() {
-            let gfd = response.gfd;
-            let loop_idx = gfd.event_loop_index();
-            if loop_idx != self.loop_id as usize {
-                eprintln!("Error: Received response for wrong engine {}", loop_idx);
-                continue;
-            }
-            let token = gfd.slab_index();
-            if let Some(conn) = self.connections.get_mut(token) {
-                if conn.gfd != gfd {
-                    // Connection mismatch (ABA problem), ignore stale response
-                    continue;
-                }
-                let _ = conn.write(&response.data);
-            } else {
-                continue;
-            }
-
-            let status = self.write_socket(token)?;
-            if matches!(status, IoStatus::Closed) {
-                self.close_connection(token)?;
-            } else {
-                self.reregister(token)?;
-            }
-        }
         Ok(())
     }
 
@@ -377,43 +322,45 @@ where
             ptr,
         );
         match self.handler.on_open(&mut conn) {
-            Action::Close => {
-                // Drop conn
-            }
+            Action::Close => self.close_connection(token.0, true)?,
             Action::None => {
                 entry.insert(conn);
-                if let Some(cnt) = &self.conn_count {
-                    cnt.fetch_add(1, Ordering::Relaxed);
-                }
+                self.conn_count.fetch_add(1, Ordering::Relaxed);
             }
             Action::Publish(_) => {}
         }
         Ok(())
     }
 
-    fn close_connection(&mut self, key: usize) -> io::Result<()> {
+    fn close_connection(&mut self, key: usize, graceful: bool) -> io::Result<()> {
         if !self.connections.contains(key) {
             return Ok(());
         }
         let conn = self.connections.get_mut(key).unwrap();
+
+        if graceful {
+            let _ = conn.flush();
+        } else {
+            conn.out_buf.clear();
+        }
+
         self.handler.on_close(conn);
         let _ = self.poll.registry().deregister(&mut conn.socket);
         self.connections.remove(key);
 
-        if let Some(cnt) = &self.conn_count {
-            cnt.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.conn_count.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn read_socket(&mut self, key: usize) -> io::Result<IoStatus> {
+    fn read_socket(&mut self, key: usize) -> io::Result<bool> {
+        let status;
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return Ok(IoStatus::Completed),
+            None => return Ok(false),
         };
 
         if conn.closed {
-            return Ok(IoStatus::Completed);
+            return Ok(false);
         }
 
         let mut bytes_read = 0;
@@ -421,23 +368,27 @@ where
 
         loop {
             if bytes_read >= max_batch_size {
-                return Ok(IoStatus::Yield);
+                status = IoStatus::Yield;
+                break;
             }
 
             match conn.socket.read(&mut self.buffer) {
-                Ok(0) => return Ok(IoStatus::Completed),
+                Ok(0) => {
+                    status = IoStatus::Closed(true);
+                    break;
+                }
                 Ok(n) => {
                     bytes_read += n;
                     self.buffer.read(n);
                     match self.handler.on_traffic(conn, &mut self.cache) {
                         Action::None => {}
-                        Action::Close => return Ok(IoStatus::Closed),
+                        Action::Close => {
+                            status = IoStatus::Closed(true);
+                            break;
+                        }
                         Action::Publish(job) => {
-                            let req = Request {
-                                gfd: conn.gfd.clone(),
-                                job,
-                            };
-                            let _ = self.request_sender.send(req);
+                            let req = Command::JobReq(conn.gfd.clone(), job);
+                            let _ = self.job_sender.send(req); // todo handler error
                         }
                     }
 
@@ -448,39 +399,70 @@ where
                     self.cache.clear();
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(IoStatus::Completed);
+                    status = IoStatus::Completed;
+                    break;
                 }
-                Err(_) => return Ok(IoStatus::Closed),
+                Err(_) => {
+                    status = IoStatus::Closed(false);
+                    break;
+                }
             }
+        }
+
+        match status {
+            IoStatus::Closed(graceful) => {
+                self.close_connection(key, graceful)?;
+                Ok(false)
+            }
+            IoStatus::Yield => Ok(true),
+            IoStatus::Completed => Ok(false),
         }
     }
 
-    fn write_socket(&mut self, key: usize) -> io::Result<IoStatus> {
+    fn write_socket(&mut self, key: usize) -> io::Result<bool> {
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return Ok(IoStatus::Completed),
+            None => return Ok(false),
         };
 
         let mut bytes_written = 0;
-        let quota = self.options.max_batch_size;
+        let max_batch_size = self.options.max_batch_size;
 
+        let mut status = IoStatus::Completed;
         while !conn.out_buf.is_empty() {
-            if bytes_written >= quota {
-                return Ok(IoStatus::Yield);
+            if bytes_written >= max_batch_size {
+                status = IoStatus::Yield;
+                break;
             }
 
             match conn.socket.write(&conn.out_buf) {
+                Ok(0) => {
+                    status = IoStatus::Closed(false);
+                    break;
+                }
                 Ok(n) => {
                     conn.out_buf.advance(n);
                     bytes_written += n;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(IoStatus::Completed);
+                    status = IoStatus::Completed;
+                    break;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return Ok(IoStatus::Closed),
+                Err(_) => {
+                    status = IoStatus::Closed(false);
+                    break;
+                }
             }
         }
-        Ok(IoStatus::Completed)
+
+        match status {
+            IoStatus::Closed(graceful) => {
+                self.close_connection(key, graceful)?;
+                Ok(false)
+            }
+            IoStatus::Yield => Ok(true),
+            IoStatus::Completed => Ok(false),
+        }
     }
 }

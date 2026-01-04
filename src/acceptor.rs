@@ -1,5 +1,7 @@
 use crate::balancer::Balancer;
-use crate::event_loop::{ConnectionInitializer, EventLoopHandle};
+use crate::command::Command;
+use crate::event_loop::EventLoopHandle;
+use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::socket_addr::NetworkAddress;
 
@@ -8,17 +10,17 @@ use std::io;
 
 const ACCEPTOR_TOKEN: Token = Token(0);
 
-pub(crate) struct Acceptor {
+pub(crate) struct Acceptor<H: EventHandler> {
     poll: Poll,
     listener: Listener,
-    workers: Vec<EventLoopHandle>,
+    workers: Vec<EventLoopHandle<H>>,
     balancer: Balancer,
 }
 
-impl Acceptor {
+impl<H: EventHandler> Acceptor<H> {
     pub fn new(
         listener: Listener,
-        workers: Vec<EventLoopHandle>,
+        workers: Vec<EventLoopHandle<H>>,
         balancer: Balancer,
     ) -> io::Result<Self> {
         let poll = Poll::new()?;
@@ -68,12 +70,8 @@ impl Acceptor {
             let idx = self.balancer.select(&self.workers);
 
             if let Some(handle) = self.workers.get(idx) {
-                let init = ConnectionInitializer {
-                    socket,
-                    peer_addr,
-                    local_addr: local_addr.clone(),
-                };
-                if let Err(_e) = handle.sender.send(init) {
+                let cmd = Command::Register(socket, local_addr.clone(), peer_addr);
+                if let Err(_e) = handle.sender.send(cmd) {
                     eprintln!("Worker {} queue full, dropping connection", idx);
                     continue;
                 }

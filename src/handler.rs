@@ -16,5 +16,5 @@ pub trait EventHandler: Send + Sync + 'static {
 
     fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action<Self::Job>;
 
-    fn on_close(&self, ctx: &mut Connection) -> Action<Self::Job>;
+    fn on_close(&self, conn: &mut Connection) -> Action<Self::Job>;
 }

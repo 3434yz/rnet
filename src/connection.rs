@@ -42,6 +42,14 @@ impl Connection {
         }
     }
 
+    pub fn local_addr(&self) -> &NetworkAddress {
+        &self.local_addr
+    }
+
+    pub fn peer_addr(&self) -> &NetworkAddress {
+        &self.peer_addr
+    }
+
     pub fn remaining(&self) -> usize {
         unsafe {
             let buffer = self.buf_ptr.as_ref();
@@ -257,7 +265,21 @@ impl Write for Connection {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        todo!()
+        while !self.out_buf.is_empty() {
+            match self.socket.write(&self.out_buf) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "connection closed",
+                    ));
+                }
+                Ok(n) => self.out_buf.advance(n),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        self.socket.flush()
     }
 }
 

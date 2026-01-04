@@ -1,4 +1,4 @@
-use crate::command::{Request, Response};
+use crate::command::Command;
 use crate::event_loop::EventLoopWaker;
 use crossbeam::channel::{Receiver, Sender};
 use std::sync::Arc;
@@ -6,8 +6,8 @@ use std::thread;
 
 pub fn start_worker<J, F>(
     id: usize,
-    task_receiver: Receiver<Request<J>>,
-    engine_registry: Vec<(Sender<Response>, Arc<EventLoopWaker>)>,
+    task_receiver: Receiver<Command<J>>,
+    engine_registry: Vec<(Sender<Command<J>>, Arc<EventLoopWaker>)>,
     processor: F,
 ) where
     J: Send + 'static,
@@ -15,28 +15,30 @@ pub fn start_worker<J, F>(
 {
     let registry = engine_registry;
     thread::spawn(move || {
-        while let Ok(req) = task_receiver.recv() {
-            let index = req.gfd.event_loop_index();
-            let data = processor(req.job);
-            let response = Response { gfd: req.gfd, data };
+        while let Ok(command) = task_receiver.recv() {
+            if let Command::JobReq(gfd, job) = command {
+                let index = gfd.event_loop_index();
+                let data = processor(job);
+                let response = Command::JobResp(gfd, data);
 
-            if let Some((resp_sender, waker)) = registry.get(index) {
-                if let Err(e) = resp_sender.send(response) {
+                if let Some((resp_sender, waker)) = registry.get(index) {
+                    if let Err(e) = resp_sender.send(response) {
+                        eprintln!(
+                            "Worker {}: Failed to send response to EventLoop {}: {}",
+                            id, index, e
+                        );
+                        continue;
+                    }
+
+                    if let Err(e) = waker.wake() {
+                        eprintln!("Worker {}: Failed to wake EventLoop {}: {}", id, index, e);
+                    }
+                } else {
                     eprintln!(
-                        "Worker {}: Failed to send response to EventLoop {}: {}",
-                        id, index, e
+                        "Worker {}: Received task from unknown EventLoop ID {}",
+                        id, index
                     );
-                    continue;
                 }
-
-                if let Err(e) = waker.wake() {
-                    eprintln!("Worker {}: Failed to wake EventLoop {}: {}", id, index, e);
-                }
-            } else {
-                eprintln!(
-                    "Worker {}: Received task from unknown EventLoop ID {}",
-                    id, index
-                );
             }
         }
 

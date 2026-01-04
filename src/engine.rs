@@ -1,6 +1,7 @@
 use crate::acceptor::Acceptor;
 use crate::balancer::Balancer;
-use crate::event_loop::{ConnectionInitializer, EventLoop, EventLoopHandle, EventLoopWaker};
+use crate::command::Command;
+use crate::event_loop::{EventLoop, EventLoopHandle, EventLoopWaker};
 use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
@@ -97,12 +98,11 @@ where
         let mut handles = Vec::new();
         let mut threads = Vec::new();
 
-        let (req_tx, req_rx) = crossbeam::channel::unbounded();
+        let (job_sender, job_receiver) = crossbeam::channel::unbounded();
         let handler = self.handler.as_ref().unwrap().clone();
 
         for (idx, core_id) in worker_cores.into_iter().enumerate() {
-            let (conn_tx, conn_rx) = crossbeam::channel::bounded::<ConnectionInitializer>(1024);
-            let (resp_tx, resp_rx) = crossbeam::channel::unbounded();
+            let (inner_sender, inner_receiver) = crossbeam::channel::unbounded();
             let conn_count = Arc::new(AtomicUsize::new(0));
 
             let mut event_loop = EventLoop::new(
@@ -110,13 +110,14 @@ where
                 None,
                 self.options.clone(),
                 handler.clone(),
-                Some(conn_rx),
-                req_tx.clone(),
-                resp_rx,
-                Some(conn_count.clone()),
+                job_sender.clone(),
+                inner_sender.clone(),
+                inner_receiver,
+                conn_count.clone(),
             )?;
 
-            let handle = EventLoopHandle::new(idx, conn_tx, event_loop.get_waker(), conn_count);
+            let handle: EventLoopHandle<H> =
+                EventLoopHandle::new(idx, inner_sender, event_loop.get_waker(), conn_count);
             handles.push(handle);
 
             let t = thread::spawn(move || {
@@ -141,7 +142,7 @@ where
         });
         threads.push(acceptor_thread);
 
-        self.start_business_workers(req_rx)?;
+        self.start_business_workers(job_receiver)?;
 
         for t in threads {
             t.join().unwrap();
@@ -152,7 +153,8 @@ where
 
     fn run_reuse_port(&mut self, worker_cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
         println!("Engine runing kernel lb");
-        let (request_sender, req_rx) = crossbeam::channel::unbounded();
+        let (job_sender, job_receiver) = crossbeam::channel::unbounded();
+
         let mut threads = Vec::new();
 
         let mut registry = Vec::new();
@@ -160,44 +162,45 @@ where
         struct PendingLoop<H: EventHandler> {
             el: EventLoop<H>,
             core: core_affinity::CoreId,
-            resp_tx: crossbeam::channel::Sender<crate::command::Response>,
+            loop_sender: crossbeam::channel::Sender<Command<H::Job>>,
             waker: Arc<EventLoopWaker>,
         }
 
         let mut pending = Vec::new();
 
         for (idx, core_id) in worker_cores.into_iter().enumerate() {
-            let (resp_tx, response_receiver) = crossbeam::channel::unbounded();
+            let (inner_sender, inner_receiver) = crossbeam::channel::unbounded();
 
             let listener = Listener::bind(self.address[0].clone(), self.options.clone())?;
+            let conn_count = Arc::new(AtomicUsize::new(0));
 
             let event_loop = EventLoop::new(
                 idx as u8,
                 Some(listener),
                 self.options.clone(),
                 handler.clone(),
-                None,
-                request_sender.clone(),
-                response_receiver,
-                None,
+                job_sender.clone(),
+                inner_sender.clone(),
+                inner_receiver,
+                conn_count,
             )?;
 
             let waker = event_loop.get_waker();
             pending.push(PendingLoop {
                 el: event_loop,
                 core: core_id,
-                resp_tx,
+                loop_sender: inner_sender,
                 waker,
             });
         }
 
         for p in &pending {
-            registry.push((p.resp_tx.clone(), p.waker.clone()));
+            registry.push((p.loop_sender.clone(), p.waker.clone()));
         }
 
         println!("Starting 4 Business Workers...");
         for i in 0..4 {
-            let rx = req_rx.clone();
+            let rx = job_receiver.clone();
             let reg = registry.clone();
             start_worker(i, rx, reg, |job| -> Vec<u8> {
                 thread::sleep(std::time::Duration::from_secs(5));
@@ -229,7 +232,7 @@ where
 
     fn start_business_workers(
         &self,
-        req_rx: crossbeam::channel::Receiver<crate::command::Request<H::Job>>,
+        job_receiver: crossbeam::channel::Receiver<Command<H::Job>>,
     ) -> io::Result<()> {
         Ok(())
     }

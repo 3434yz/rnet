@@ -1,11 +1,11 @@
-use crate::gfd::Gfd;
+use crate::{gfd::Gfd, socket::Socket, socket_addr::NetworkAddress};
 
-pub struct Request<J> {
-    pub gfd: Gfd,
-    pub job: J,
-}
-
-pub struct Response {
-    pub gfd: Gfd,
-    pub data: Vec<u8>,
+pub enum Command<J> {
+    JobReq(Gfd, J),
+    JobResp(Gfd, Vec<u8>),
+    Register(Socket, NetworkAddress, NetworkAddress),
+    Close(usize),
+    Wake(),
+    Read(usize),
+    Write(usize),
 }
