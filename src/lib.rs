@@ -10,6 +10,7 @@ pub mod handler;
 pub mod io_buffer;
 pub mod listener;
 pub mod options;
+pub mod poller;
 pub mod socket;
 pub mod socket_addr;
 pub mod worker;

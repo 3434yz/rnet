@@ -1,13 +1,13 @@
 use crate::command::Command;
-use crate::event_loop::EventLoopWaker;
+use crate::poller::Waker;
 use crossbeam::channel::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 
 pub fn start_worker<J, F>(
     id: usize,
-    task_receiver: Receiver<Command<J>>,
-    engine_registry: Vec<(Sender<Command<J>>, Arc<EventLoopWaker>)>,
+    job_receiver: Receiver<Command<J>>,
+    engine_registry: Vec<(Sender<Command<J>>, Arc<Waker>)>,
     processor: F,
 ) where
     J: Send + 'static,
@@ -15,7 +15,7 @@ pub fn start_worker<J, F>(
 {
     let registry = engine_registry;
     thread::spawn(move || {
-        while let Ok(command) = task_receiver.recv() {
+        while let Ok(command) = job_receiver.recv() {
             if let Command::JobReq(gfd, job) = command {
                 let index = gfd.event_loop_index();
                 let data = processor(job);

@@ -15,8 +15,8 @@ struct MyHandler {
 impl EventHandler for MyHandler {
     type Job = Vec<u8>;
 
-    fn on_open(&self, _conn: &mut Connection) -> Action<Self::Job> {
-        // println!("New Connect");
+    fn on_open(&self, conn: &mut Connection) -> Action<Self::Job> {
+        // println!("New Connect in {}", conn.gfd.event_loop_index());
         Action::None
     }
 
@@ -37,7 +37,7 @@ fn main() {
     let mut options = Options::builder()
         // .reuse_port(true)
         .reuse_addr(true)
-        .num_event_loop(8)
+        .num_event_loop(5)
         .build();
 
     let addrs = vec!["tcp://127.0.0.1:9000"];

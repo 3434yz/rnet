@@ -5,24 +5,24 @@ use crate::handler::{Action, EventHandler};
 use crate::io_buffer::IOBuffer;
 use crate::listener::Listener;
 use crate::options::Options;
+use crate::poller::{Poller, Waker};
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
 use bytes::{Buf, BytesMut};
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use mio::event::Event;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::{Events, Token};
 use slab::Slab;
 
 use std::io::{self, Read, Write};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const SERVER_TOKEN: Token = Token(usize::MAX);
 const WAKE_TOKEN: Token = Token(usize::MAX - 1);
-const DEFAULT_BUF_SIZE: usize = 64 * 1024;
 const EVENTS_CAP: usize = 1024;
 
 enum IoStatus {
@@ -33,37 +33,20 @@ enum IoStatus {
 
 pub(crate) struct EventLoopBuilder {}
 
-#[derive(Debug)]
-pub struct EventLoopWaker {
-    waker: Waker,
-    awoken: AtomicBool,
-}
-
-impl EventLoopWaker {
-    pub fn new(waker: Waker) -> Self {
-        Self {
-            waker,
-            awoken: AtomicBool::new(false),
-        }
-    }
-
-    pub fn wake(&self) -> io::Result<()> {
-        if !self.awoken.swap(true, Ordering::SeqCst) {
-            self.waker.wake()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn reset(&self) {
-        self.awoken.store(false, Ordering::SeqCst);
-    }
-}
+// impl<H> EventLoopBuilder<H>
+// where
+//     H: EventHandler,
+// {
+//     fn build() -> (EventLoop<H>, EventLoopHandle<H>) {
+//         unimplemented!()
+//     }
+// }
 
 #[derive(Clone, Debug)]
 pub struct EventLoopHandle<H: EventHandler> {
     pub idx: usize,
-    pub sender: Sender<Command<H::Job>>,
-    pub waker: Arc<EventLoopWaker>,
+    pub command_sender: Sender<Command<H::Job>>,
+    pub waker: Arc<Waker>,
     pub conn_count: Arc<AtomicUsize>,
 }
 
@@ -74,12 +57,12 @@ where
     pub fn new(
         idx: usize,
         sender: Sender<Command<H::Job>>,
-        waker: Arc<EventLoopWaker>,
+        waker: Arc<Waker>,
         conn_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             idx,
-            sender,
+            command_sender: sender,
             waker,
             conn_count,
         }
@@ -95,8 +78,8 @@ where
     H: EventHandler,
 {
     pub loop_id: u8,
-    poll: Poll,
-    waker: Arc<EventLoopWaker>,
+    poll: Poller,
+    waker: Arc<Waker>,
     listener: Option<Listener>,
     options: Arc<Options>,
     connections: Slab<Connection>,
@@ -114,8 +97,7 @@ where
     H: EventHandler,
 {
     pub(crate) fn new(
-        idx: u8,
-        mut listener: Option<Listener>,
+        loop_id: u8,
         options: Arc<Options>,
         handler: Arc<H>,
         job_sender: Sender<Command<H::Job>>,
@@ -123,23 +105,16 @@ where
         inner_receiver: Receiver<Command<H::Job>>,
         conn_count: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
-        let poll = Poll::new()?;
-        let waker = Waker::new(poll.registry(), WAKE_TOKEN)?;
-        let waker = Arc::new(EventLoopWaker::new(waker));
-
-        if let Some(listener) = listener.as_mut() {
-            poll.registry()
-                .register(listener, SERVER_TOKEN, Interest::READABLE)?;
-        }
-
-        let buffer = Box::new(IOBuffer::new(DEFAULT_BUF_SIZE));
-        let cache = BytesMut::with_capacity(DEFAULT_BUF_SIZE);
+        let poll = Poller::new()?;
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
+        let buffer = Box::new(IOBuffer::new(options.read_buffer_cap));
+        let cache = BytesMut::with_capacity(options.read_buffer_cap);
         let connections = Slab::with_capacity(4096);
 
         Ok(Self {
-            loop_id: idx,
+            loop_id,
             poll,
-            listener,
+            listener: None,
             connections,
             handler,
             buffer,
@@ -153,20 +128,30 @@ where
         })
     }
 
+    pub fn listener(mut self, listener: Listener) -> Self {
+        self.listener = Some(listener);
+        self
+    }
+
+    pub fn build(mut self) -> io::Result<Self> {
+        if let Some(listener) = &mut self.listener {
+            self.poll.register(listener, SERVER_TOKEN)?;
+        }
+        Ok(self)
+    }
+
     fn reregister(&mut self, key: usize) -> io::Result<()> {
         if let Some(conn) = self.connections.get_mut(key) {
-            let mut interests = Interest::READABLE;
             if !conn.out_buf.is_empty() {
-                interests |= Interest::WRITABLE;
+                self.poll.enable_write(&mut conn.socket, Token(key))?;
+            } else {
+                self.poll.disable_write(&mut conn.socket, Token(key))?;
             }
-            self.poll
-                .registry()
-                .reregister(&mut conn.socket, Token(key), interests)?;
         }
         Ok(())
     }
 
-    pub(crate) fn get_waker(&self) -> Arc<EventLoopWaker> {
+    pub(crate) fn get_waker(&self) -> Arc<Waker> {
         self.waker.clone()
     }
 
@@ -304,11 +289,8 @@ where
 
         let entry = self.connections.vacant_entry();
         let token = Token(entry.key());
-        let interests = Interest::READABLE;
 
-        self.poll
-            .registry()
-            .register(&mut socket, token, interests)?;
+        self.poll.register(&mut socket, token)?;
 
         let raw_ptr = self.buffer.as_mut() as *mut IOBuffer;
         let ptr = NonNull::new(raw_ptr).expect("create ptr error");
@@ -327,7 +309,7 @@ where
                 entry.insert(conn);
                 self.conn_count.fetch_add(1, Ordering::Relaxed);
             }
-            Action::Publish(_) => {}
+            Action::Submit(_) => {}
         }
         Ok(())
     }
@@ -345,7 +327,7 @@ where
         }
 
         self.handler.on_close(conn);
-        let _ = self.poll.registry().deregister(&mut conn.socket);
+        let _ = self.poll.deregister(&mut conn.socket);
         self.connections.remove(key);
 
         self.conn_count.fetch_sub(1, Ordering::Relaxed);
@@ -386,7 +368,7 @@ where
                             status = IoStatus::Closed(true);
                             break;
                         }
-                        Action::Publish(job) => {
+                        Action::Submit(job) => {
                             let req = Command::JobReq(conn.gfd.clone(), job);
                             let _ = self.job_sender.send(req); // todo handler error
                         }

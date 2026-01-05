@@ -1,10 +1,11 @@
 use crate::acceptor::Acceptor;
 use crate::balancer::Balancer;
 use crate::command::Command;
-use crate::event_loop::{EventLoop, EventLoopHandle, EventLoopWaker};
+use crate::event_loop::{EventLoop, EventLoopHandle};
 use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
+use crate::poller::Waker;
 use crate::socket_addr::NetworkAddress;
 use crate::worker::start_worker;
 
@@ -107,7 +108,6 @@ where
 
             let mut event_loop = EventLoop::new(
                 idx as u8,
-                None,
                 self.options.clone(),
                 handler.clone(),
                 job_sender.clone(),
@@ -163,7 +163,7 @@ where
             el: EventLoop<H>,
             core: core_affinity::CoreId,
             loop_sender: crossbeam::channel::Sender<Command<H::Job>>,
-            waker: Arc<EventLoopWaker>,
+            waker: Arc<Waker>,
         }
 
         let mut pending = Vec::new();
@@ -176,14 +176,15 @@ where
 
             let event_loop = EventLoop::new(
                 idx as u8,
-                Some(listener),
                 self.options.clone(),
                 handler.clone(),
                 job_sender.clone(),
                 inner_sender.clone(),
                 inner_receiver,
                 conn_count,
-            )?;
+            )?
+            .listener(listener)
+            .build()?;
 
             let waker = event_loop.get_waker();
             pending.push(PendingLoop {

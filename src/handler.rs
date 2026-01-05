@@ -1,12 +1,11 @@
 use crate::connection::Connection;
-use crate::socket_addr::NetworkAddress;
 
 use bytes::BytesMut;
 
 pub enum Action<J> {
     None,
     Close,
-    Publish(J),
+    Submit(J),
     // Shutdown,
 }
 
