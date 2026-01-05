@@ -1,9 +1,12 @@
+use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 
 use bytes::BytesMut;
+
+use rnet::worker;
 
 use std::io::Write;
 
@@ -12,22 +15,29 @@ struct MyHandler {
     engine: Option<EngineHandler>,
 }
 
-impl EventHandler for MyHandler {
-    type Job = Vec<u8>;
+impl MyHandler {
+    fn something() {}
+}
 
-    fn on_open(&self, conn: &mut Connection) -> Action<Self::Job> {
+impl EventHandler for MyHandler {
+    fn on_open(&self, conn: &mut Connection) -> Action {
         // println!("New Connect in {}", conn.gfd.event_loop_index());
         Action::None
     }
 
-    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action<Self::Job> {
+    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action {
         if let Some(datas) = conn.next(None, cache) {
             let _ = conn.write(datas);
         }
+        let gfd = conn.gfd();
+        worker::submit(gfd, move || -> Command {
+            MyHandler::something();
+            Command::None
+        });
         Action::None
     }
 
-    fn on_close(&self, _ctx: &mut Connection) -> Action<Self::Job> {
+    fn on_close(&self, _ctx: &mut Connection) -> Action {
         // println!("Close Connect");
         Action::None
     }

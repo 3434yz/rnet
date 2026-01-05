@@ -1,47 +1,77 @@
 use crate::command::Command;
+use crate::gfd::Gfd;
 use crate::poller::Waker;
-use crossbeam::channel::{Receiver, Sender};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread;
 
-pub fn start_worker<J, F>(
-    id: usize,
-    job_receiver: Receiver<Command<J>>,
-    engine_registry: Vec<(Sender<Command<J>>, Arc<Waker>)>,
-    processor: F,
-) where
-    J: Send + 'static,
-    F: Fn(J) -> Vec<u8> + Send + Sync + 'static,
-{
-    let registry = engine_registry;
-    thread::spawn(move || {
-        while let Ok(command) = job_receiver.recv() {
-            if let Command::JobReq(gfd, job) = command {
-                let index = gfd.event_loop_index();
-                let data = processor(job);
-                let response = Command::JobResp(gfd, data);
+static GLOBAL_SENDER: OnceLock<Sender<Task>> = OnceLock::new();
 
-                if let Some((resp_sender, waker)) = registry.get(index) {
-                    if let Err(e) = resp_sender.send(response) {
-                        eprintln!(
-                            "Worker {}: Failed to send response to EventLoop {}: {}",
-                            id, index, e
-                        );
+pub struct Task {
+    gfd: Gfd,
+    closure: Box<dyn FnOnce() -> Command + Send>,
+}
+
+pub fn submit<F>(gfd: Gfd, f: F)
+where
+    F: FnOnce() -> Command + Send + 'static,
+{
+    if let Some(sender) = GLOBAL_SENDER.get() {
+        let task = Task {
+            gfd,
+            closure: Box::new(f),
+        };
+        let _ = sender.send(task);
+    } else {
+        eprintln!("WorkerPool not initialized, task dropped");
+    }
+}
+
+pub struct WorkerPool {
+    registry: Vec<(Sender<Command>, Arc<Waker>)>,
+    receiver: Receiver<Task>,
+}
+
+impl WorkerPool {
+    pub fn new(registry: Vec<(Sender<Command>, Arc<Waker>)>) -> Self {
+        let (tx, rx) = unbounded();
+        if GLOBAL_SENDER.set(tx).is_err() {
+            eprintln!("Warning: WorkerPool initialized more than once");
+        }
+        Self {
+            registry,
+            receiver: rx,
+        }
+    }
+
+    pub fn run(self, count: usize) {
+        let receiver = self.receiver;
+        let registry = self.registry;
+
+        for id in 0..count {
+            let rx = receiver.clone();
+            let reg = registry.clone();
+            thread::spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    let command = (task.closure)();
+                    if let Command::None = command {
                         continue;
                     }
 
-                    if let Err(e) = waker.wake() {
-                        eprintln!("Worker {}: Failed to wake EventLoop {}: {}", id, index, e);
-                    }
-                } else {
-                    eprintln!(
-                        "Worker {}: Received task from unknown EventLoop ID {}",
-                        id, index
-                    );
-                }
-            }
-        }
+                    let gfd = task.gfd;
+                    let index = gfd.event_loop_index();
 
-        println!("Worker {} stopped.", id);
-    });
+                    if let Some((resp_sender, waker)) = reg.get(index) {
+                        if let Err(e) = resp_sender.send(command) {
+                            eprintln!("Worker {}: Failed to send response: {}", id, e);
+                            continue;
+                        }
+                        let _ = waker.wake();
+                    }
+                }
+                println!("Worker {} stopped.", id);
+            });
+        }
+    }
 }

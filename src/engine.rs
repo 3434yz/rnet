@@ -7,7 +7,7 @@ use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
 use crate::poller::Waker;
 use crate::socket_addr::NetworkAddress;
-use crate::worker::start_worker;
+use crate::worker::WorkerPool;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -99,7 +99,6 @@ where
         let mut handles = Vec::new();
         let mut threads = Vec::new();
 
-        let (job_sender, job_receiver) = crossbeam::channel::unbounded();
         let handler = self.handler.as_ref().unwrap().clone();
 
         for (idx, core_id) in worker_cores.into_iter().enumerate() {
@@ -110,13 +109,12 @@ where
                 idx as u8,
                 self.options.clone(),
                 handler.clone(),
-                job_sender.clone(),
                 inner_sender.clone(),
                 inner_receiver,
                 conn_count.clone(),
             )?;
 
-            let handle: EventLoopHandle<H> =
+            let handle =
                 EventLoopHandle::new(idx, inner_sender, event_loop.get_waker(), conn_count);
             handles.push(handle);
 
@@ -131,6 +129,12 @@ where
             threads.push(t);
         }
 
+        // 构建 Registry，用于 WorkerPool 回传消息
+        let mut registry = Vec::new();
+        for h in &handles {
+            registry.push((h.command_sender.clone(), h.waker.clone()));
+        }
+
         let balancer = self.lb_policy.take().unwrap();
         let mut acceptor = Acceptor::new(listener, handles, balancer)?;
 
@@ -142,7 +146,8 @@ where
         });
         threads.push(acceptor_thread);
 
-        self.start_business_workers(job_receiver)?;
+        let worker_pool = WorkerPool::new(registry);
+        worker_pool.run(4);
 
         for t in threads {
             t.join().unwrap();
@@ -153,7 +158,6 @@ where
 
     fn run_reuse_port(&mut self, worker_cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
         println!("Engine runing kernel lb");
-        let (job_sender, job_receiver) = crossbeam::channel::unbounded();
 
         let mut threads = Vec::new();
 
@@ -162,7 +166,7 @@ where
         struct PendingLoop<H: EventHandler> {
             el: EventLoop<H>,
             core: core_affinity::CoreId,
-            loop_sender: crossbeam::channel::Sender<Command<H::Job>>,
+            loop_sender: crossbeam::channel::Sender<Command>,
             waker: Arc<Waker>,
         }
 
@@ -178,7 +182,6 @@ where
                 idx as u8,
                 self.options.clone(),
                 handler.clone(),
-                job_sender.clone(),
                 inner_sender.clone(),
                 inner_receiver,
                 conn_count,
@@ -200,14 +203,8 @@ where
         }
 
         println!("Starting 4 Business Workers...");
-        for i in 0..4 {
-            let rx = job_receiver.clone();
-            let reg = registry.clone();
-            start_worker(i, rx, reg, |job| -> Vec<u8> {
-                thread::sleep(std::time::Duration::from_secs(5));
-                job.into()
-            });
-        }
+        let worker_pool = WorkerPool::new(registry);
+        worker_pool.run(4);
 
         for p in pending {
             let mut el = p.el;
@@ -231,13 +228,6 @@ where
         Ok(())
     }
 
-    fn start_business_workers(
-        &self,
-        job_receiver: crossbeam::channel::Receiver<Command<H::Job>>,
-    ) -> io::Result<()> {
-        Ok(())
-    }
-
     pub fn handler(&mut self, handler: Arc<H>) {
         self.handler = Some(handler.clone());
     }
@@ -257,18 +247,16 @@ mod tests {
     }
 
     impl EventHandler for GameServer {
-        type Job = Vec<u8>;
-
-        fn on_open(&self, _conn: &mut Connection) -> Action<Self::Job> {
+        fn on_open(&self, _conn: &mut Connection) -> Action {
             println!("New Connect");
             Action::None
         }
 
-        fn on_traffic(&self, _conn: &mut Connection, _cache: &mut BytesMut) -> Action<Self::Job> {
+        fn on_traffic(&self, _conn: &mut Connection, _cache: &mut BytesMut) -> Action {
             Action::None
         }
 
-        fn on_close(&self, _ctx: &mut Connection) -> Action<Self::Job> {
+        fn on_close(&self, _ctx: &mut Connection) -> Action {
             println!("Close Connect");
             Action::None
         }

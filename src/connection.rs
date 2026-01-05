@@ -1,3 +1,4 @@
+use crate::command::Command;
 use crate::gfd::Gfd;
 use crate::io_buffer::IOBuffer;
 use crate::options::Options;
@@ -5,6 +6,7 @@ use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
 use bytes::{Buf, BytesMut};
+use crossbeam::channel::Sender;
 
 use std::io::{Read, Write};
 use std::ptr::NonNull;
@@ -18,6 +20,7 @@ pub struct Connection {
     pub(crate) closed: bool,
     pub(crate) in_buf: BytesMut,
     pub(crate) out_buf: BytesMut,
+    pub(crate) sender: Sender<Command>,
     buf_ptr: NonNull<IOBuffer>,
 }
 
@@ -28,6 +31,7 @@ impl Connection {
         options: Arc<Options>,
         local_addr: NetworkAddress,
         peer_addr: NetworkAddress,
+        sender: Sender<Command>,
         buf_ptr: NonNull<IOBuffer>,
     ) -> Self {
         Self {
@@ -38,8 +42,13 @@ impl Connection {
             closed: false,
             in_buf: BytesMut::with_capacity(options.read_buffer_cap),
             out_buf: BytesMut::with_capacity(options.write_buffer_cap),
+            sender,
             buf_ptr,
         }
+    }
+
+    pub fn gfd(&self) -> Gfd {
+        self.gfd
     }
 
     pub fn local_addr(&self) -> &NetworkAddress {
@@ -202,6 +211,14 @@ impl Connection {
             Some(actual_len)
         }
     }
+
+    pub fn close(&mut self) {
+        let _ = self.sender.send(Command::Close(self.gfd.slab_index()));
+    }
+
+    pub fn aysnc_write(&mut self, buf: &[u8]) {
+        let _ = self.sender.send(Command::Write(self.gfd, buf.to_vec()));
+    }
 }
 
 impl Read for Connection {
@@ -264,6 +281,7 @@ impl Write for Connection {
         }
     }
 
+    // todo 饥饿读写
     fn flush(&mut self) -> std::io::Result<()> {
         while !self.out_buf.is_empty() {
             match self.socket.write(&self.out_buf) {

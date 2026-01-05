@@ -1,9 +1,8 @@
 use crate::event_loop::EventLoopHandle;
-use crate::handler::EventHandler;
 use crate::options::LoadBalancing;
 use std::sync::atomic::AtomicUsize;
 pub trait LoadBalancer: Send + Sync {
-    fn select<H: EventHandler>(&self, workers: &[EventLoopHandle<H>]) -> usize;
+    fn select(&self, workers: &[EventLoopHandle]) -> usize;
 }
 
 pub enum Balancer {
@@ -20,7 +19,7 @@ impl Balancer {
         }
     }
 
-    pub fn select<H: EventHandler>(&self, workers: &[EventLoopHandle<H>]) -> usize {
+    pub fn select(&self, workers: &[EventLoopHandle]) -> usize {
         match self {
             Self::RoundRobin(inner) => inner.select(workers),
             Self::LeastConnections(inner) => inner.select(workers),
@@ -47,7 +46,7 @@ impl Default for RoundRobin {
 }
 
 impl LoadBalancer for RoundRobin {
-    fn select<H: EventHandler>(&self, workers: &[EventLoopHandle<H>]) -> usize {
+    fn select(&self, workers: &[EventLoopHandle]) -> usize {
         if workers.is_empty() {
             return 0;
         }
@@ -65,7 +64,7 @@ impl Default for LeastConnections {
 }
 
 impl LoadBalancer for LeastConnections {
-    fn select<H: EventHandler>(&self, workers: &[EventLoopHandle<H>]) -> usize {
+    fn select(&self, workers: &[EventLoopHandle]) -> usize {
         if workers.is_empty() {
             return 0;
         }

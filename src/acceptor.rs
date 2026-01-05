@@ -1,7 +1,6 @@
 use crate::balancer::Balancer;
 use crate::command::Command;
 use crate::event_loop::EventLoopHandle;
-use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::socket_addr::NetworkAddress;
 
@@ -10,17 +9,17 @@ use std::io;
 
 const ACCEPTOR_TOKEN: Token = Token(0);
 
-pub(crate) struct Acceptor<H: EventHandler> {
+pub(crate) struct Acceptor {
     poll: Poll,
     listener: Listener,
-    workers: Vec<EventLoopHandle<H>>,
+    workers: Vec<EventLoopHandle>,
     balancer: Balancer,
 }
 
-impl<H: EventHandler> Acceptor<H> {
+impl Acceptor {
     pub fn new(
         listener: Listener,
-        workers: Vec<EventLoopHandle<H>>,
+        workers: Vec<EventLoopHandle>,
         balancer: Balancer,
     ) -> io::Result<Self> {
         let poll = Poll::new()?;

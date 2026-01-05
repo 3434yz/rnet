@@ -43,20 +43,17 @@ pub(crate) struct EventLoopBuilder {}
 // }
 
 #[derive(Clone, Debug)]
-pub struct EventLoopHandle<H: EventHandler> {
+pub struct EventLoopHandle {
     pub idx: usize,
-    pub command_sender: Sender<Command<H::Job>>,
+    pub command_sender: Sender<Command>,
     pub waker: Arc<Waker>,
     pub conn_count: Arc<AtomicUsize>,
 }
 
-impl<H> EventLoopHandle<H>
-where
-    H: EventHandler,
-{
+impl EventLoopHandle {
     pub fn new(
         idx: usize,
-        sender: Sender<Command<H::Job>>,
+        sender: Sender<Command>,
         waker: Arc<Waker>,
         conn_count: Arc<AtomicUsize>,
     ) -> Self {
@@ -86,9 +83,8 @@ where
     handler: Arc<H>,
     buffer: Box<IOBuffer>,
     cache: BytesMut,
-    job_sender: Sender<Command<H::Job>>,
-    inner_sender: Sender<Command<H::Job>>,
-    inner_receiver: Receiver<Command<H::Job>>,
+    inner_sender: Sender<Command>,
+    inner_receiver: Receiver<Command>,
     conn_count: Arc<AtomicUsize>,
 }
 
@@ -100,9 +96,8 @@ where
         loop_id: u8,
         options: Arc<Options>,
         handler: Arc<H>,
-        job_sender: Sender<Command<H::Job>>,
-        inner_sender: Sender<Command<H::Job>>,
-        inner_receiver: Receiver<Command<H::Job>>,
+        inner_sender: Sender<Command>,
+        inner_receiver: Receiver<Command>,
         conn_count: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poll = Poller::new()?;
@@ -119,7 +114,6 @@ where
             handler,
             buffer,
             cache,
-            job_sender,
             inner_sender,
             inner_receiver,
             waker,
@@ -188,11 +182,8 @@ where
         loop {
             match self.inner_receiver.try_recv() {
                 Ok(c) => match c {
-                    Command::JobReq(gfd, job) => {
-                        let req = Command::JobReq(gfd, job);
-                        let _ = self.job_sender.send(req); // todo handler error
-                    }
-                    Command::JobResp(gfd, data) => {
+                    Command::None => {}
+                    Command::Write(gfd, data) => {
                         let loop_idx = gfd.event_loop_index();
                         if loop_idx != self.loop_id as usize {
                             eprintln!("Error: Received response for wrong engine {}", loop_idx);
@@ -215,17 +206,17 @@ where
                         self.register(socket, local_addr, peer_addr)?
                     }
                     Command::Close(key) => self.close_connection(key, true)?,
-                    Command::Read(key) => {
+                    Command::IORead(key) => {
                         if self.read_socket(key)? {
-                            let _ = self.inner_sender.send(Command::Read(key));
+                            let _ = self.inner_sender.send(Command::IORead(key));
                         }
                     }
-                    Command::Write(key) => {
+                    Command::IOWrite(key) => {
                         if self.write_socket(key)? {
-                            let _ = self.inner_sender.send(Command::Write(key));
+                            let _ = self.inner_sender.send(Command::IOWrite(key));
                         }
                     }
-                    Command::Wake() => todo!(),
+                    Command::Wake() => {}
                 },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
@@ -301,6 +292,7 @@ where
             self.options.clone(),
             local_addr,
             peer_addr,
+            self.inner_sender.clone(),
             ptr,
         );
         match self.handler.on_open(&mut conn) {
@@ -309,7 +301,6 @@ where
                 entry.insert(conn);
                 self.conn_count.fetch_add(1, Ordering::Relaxed);
             }
-            Action::Submit(_) => {}
         }
         Ok(())
     }
@@ -367,10 +358,6 @@ where
                         Action::Close => {
                             status = IoStatus::Closed(true);
                             break;
-                        }
-                        Action::Submit(job) => {
-                            let req = Command::JobReq(conn.gfd.clone(), job);
-                            let _ = self.job_sender.send(req); // todo handler error
                         }
                     }
 
