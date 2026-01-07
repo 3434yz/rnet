@@ -1,7 +1,9 @@
+use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
+use rnet::worker;
 
 use bytes::BytesMut;
 
@@ -10,6 +12,12 @@ use std::io::Write;
 #[derive(Clone, Copy)]
 struct MyHandler {
     engine: Option<EngineHandler>,
+}
+
+impl MyHandler {
+    fn something() -> Vec<u8> {
+        b"HelloWorld"[..].to_vec()
+    }
 }
 
 impl EventHandler for MyHandler {
@@ -22,6 +30,10 @@ impl EventHandler for MyHandler {
         if let Some(datas) = conn.znext(None, cache) {
             let _ = conn.write(datas);
         }
+        let gfd = conn.gfd();
+        worker::submit(gfd, move || -> Command {
+            Command::Write(gfd, MyHandler::something())
+        });
         Action::None
     }
 
@@ -32,43 +44,13 @@ impl EventHandler for MyHandler {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-
-    let mut port: u16 = 0;
-    let mut num_event_loop: usize = 0;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" => {
-                if i + 1 < args.len() {
-                    port = args[i + 1].parse().expect("Invalid port number");
-                    i += 1;
-                }
-            }
-            "--loops" => {
-                if i + 1 < args.len() {
-                    num_event_loop = args[i + 1].parse().expect("Invalid num_event_loop");
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    // 校验必填参数
-    if port == 0 || num_event_loop == 0 {
-        eprintln!("Usage: echo --port <port> --loops <num_event_loop>");
-        std::process::exit(1);
-    }
-
     let mut options = Options::builder()
+        // .reuse_port(true)
         .reuse_addr(true)
-        .num_event_loop(num_event_loop)
+        .num_event_loop(8)
         .build();
 
-    let addrs = vec![format!("tcp://127.0.0.1:{}", port)];
+    let addrs = vec!["tcp://127.0.0.1:9000"];
     let net_socket_addrs = options.normalize(&addrs).unwrap();
 
     let (mut engine, _handler_copy) =

@@ -179,7 +179,7 @@ where
     }
 
     fn process_command(&mut self) -> io::Result<()> {
-        loop {
+        for _ in 0..1024 {
             match self.inner_receiver.try_recv() {
                 Ok(c) => match c {
                     Command::None => {}
@@ -207,14 +207,10 @@ where
                     }
                     Command::Close(key) => self.close_connection(key, true)?,
                     Command::IORead(key) => {
-                        if self.read_socket(key)? {
-                            let _ = self.inner_sender.send(Command::IORead(key));
-                        }
+                        self.read_socket(key)?;
                     }
                     Command::IOWrite(key) => {
-                        if self.write_socket(key)? {
-                            let _ = self.inner_sender.send(Command::IOWrite(key));
-                        }
+                        self.write_socket(key)?;
                     }
                     Command::Wake() => {}
                 },
@@ -325,15 +321,15 @@ where
         Ok(())
     }
 
-    fn read_socket(&mut self, key: usize) -> io::Result<bool> {
+    fn read_socket(&mut self, key: usize) -> io::Result<()> {
         let status;
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return Ok(false),
+            None => return Ok(()),
         };
 
         if conn.closed {
-            return Ok(false);
+            return Ok(());
         }
 
         let mut bytes_read = 0;
@@ -381,17 +377,20 @@ where
         match status {
             IoStatus::Closed(graceful) => {
                 self.close_connection(key, graceful)?;
-                Ok(false)
             }
-            IoStatus::Yield => Ok(true),
-            IoStatus::Completed => Ok(false),
+            IoStatus::Yield => {
+                let _ = self.inner_sender.send(Command::IORead(key));
+                let _ = self.waker.wake();
+            }
+            IoStatus::Completed => {}
         }
+        Ok(())
     }
 
-    fn write_socket(&mut self, key: usize) -> io::Result<bool> {
+    fn write_socket(&mut self, key: usize) -> io::Result<()> {
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return Ok(false),
+            None => return Ok(()),
         };
 
         let mut bytes_written = 0;
@@ -404,7 +403,12 @@ where
                 break;
             }
 
-            match conn.socket.write(&conn.out_buf) {
+            let total_len = conn.out_buf.len();
+            let remaining = max_batch_size - bytes_written;
+            let actual_len = std::cmp::min(remaining, total_len);
+            let data = &conn.out_buf[0..actual_len];
+
+            match conn.socket.write(data) {
                 Ok(0) => {
                     status = IoStatus::Closed(false);
                     break;
@@ -428,10 +432,13 @@ where
         match status {
             IoStatus::Closed(graceful) => {
                 self.close_connection(key, graceful)?;
-                Ok(false)
             }
-            IoStatus::Yield => Ok(true),
-            IoStatus::Completed => Ok(false),
+            IoStatus::Yield => {
+                let _ = self.inner_sender.send(Command::IOWrite(key));
+                self.waker.wake()?;
+            }
+            IoStatus::Completed => {}
         }
+        Ok(())
     }
 }

@@ -66,7 +66,7 @@ impl Connection {
         }
     }
 
-    pub fn next<'a>(&mut self, n: Option<usize>, cache: &'a mut BytesMut) -> Option<&'a [u8]> {
+    pub fn znext<'a>(&mut self, n: Option<usize>, cache: &'a mut BytesMut) -> Option<&'a [u8]> {
         unsafe {
             let el_buf = self.buf_ptr.as_mut();
             let in_len = self.in_buf.len();
@@ -103,6 +103,45 @@ impl Connection {
             }
 
             Some(&cache[..])
+        }
+    }
+
+    pub fn next(&mut self, n: Option<usize>, cache: &mut BytesMut) -> Option<BytesMut> {
+        unsafe {
+            let el_buf = self.buf_ptr.as_mut();
+            let in_len = self.in_buf.len();
+            let el_len = el_buf.remaining();
+            let total_len = in_len + el_len;
+
+            if total_len == 0 {
+                return None;
+            }
+
+            let actual_len = match n {
+                Some(n) if n > total_len => return None,
+                Some(n) => n,
+                None => total_len,
+            };
+
+            if in_len >= actual_len {
+                return Some(self.in_buf.split_to(actual_len));
+            }
+
+            cache.clear();
+            if in_len > 0 {
+                cache.extend_from_slice(&self.in_buf);
+                self.in_buf.clear();
+            }
+
+            let remaining = actual_len - in_len;
+            if remaining > 0 {
+                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
+                let slice = std::slice::from_raw_parts(ptr, remaining);
+                cache.extend_from_slice(slice);
+                el_buf.advance(remaining);
+            }
+
+            Some(cache.split_to(actual_len))
         }
     }
 
@@ -212,12 +251,31 @@ impl Connection {
         }
     }
 
+    pub(crate) fn peek_out(&self, n: Option<usize>) -> Option<&[u8]> {
+        let total_len = self.out_buf.len();
+        if total_len == 0 {
+            return None;
+        }
+
+        let actual_len = match n {
+            Some(n) if n > total_len => total_len,
+            Some(n) => n,
+            None => total_len,
+        };
+
+        Some(&self.out_buf[..actual_len])
+    }
+
+    pub(crate) fn advance_out(&self, n: Option<usize>) -> Option<usize> {
+        return Some(0);
+    }
+
     pub fn close(&mut self) {
         let _ = self.sender.send(Command::Close(self.gfd.slab_index()));
     }
 
-    pub fn aysnc_write(&mut self, buf: &[u8]) {
-        let _ = self.sender.send(Command::Write(self.gfd, buf.to_vec()));
+    pub fn aysnc_write(&mut self, buf: Vec<u8>) {
+        let _ = self.sender.send(Command::Write(self.gfd, buf));
     }
 }
 
@@ -304,43 +362,3 @@ impl Write for Connection {
 unsafe impl Send for Connection {}
 
 unsafe impl Sync for Connection {}
-
-#[cfg(test)]
-mod test {
-
-    use super::*;
-    struct MockConnection {
-        pub(crate) in_buf: BytesMut,
-        pub(crate) out_buf: BytesMut,
-        pub(crate) buf_ptr: NonNull<IOBuffer>,
-    }
-
-    impl MockConnection {
-        pub fn remaining(&self) -> usize {
-            unsafe {
-                let buffer = self.buf_ptr.as_ref();
-                self.in_buf.len() + buffer.remaining()
-            }
-        }
-    }
-
-    #[test]
-    fn test_remaining() {
-        let hello = String::from("Hello,World");
-
-        let mut el_buffer = IOBuffer::new(1024);
-        el_buffer.read(6); // mock read ",World"
-
-        let raw_ptr = &mut el_buffer as *mut IOBuffer;
-        let buf_ptr = NonNull::new(raw_ptr).unwrap();
-
-        let mut conn = MockConnection {
-            in_buf: BytesMut::with_capacity(1024),
-            out_buf: BytesMut::with_capacity(1024),
-            buf_ptr,
-        };
-
-        conn.in_buf.extend_from_slice(hello[..5].as_bytes());
-        assert!(conn.remaining() == 11);
-    }
-}

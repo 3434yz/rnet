@@ -41,7 +41,7 @@ impl EventHandler for ChatRoomHandler {
 
             if let Some(len) = found_len {
                 // Consume the line
-                if let Some(data) = conn.next(Some(len), cache) {
+                if let Some(data) = conn.znext(Some(len), cache) {
                     let msg = data.to_vec();
                     let sender_gfd = conn.gfd();
 

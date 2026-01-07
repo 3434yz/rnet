@@ -71,7 +71,6 @@ mod tests {
 
     #[test]
     fn test_gfd_layout() {
-        // 验证结构体大小确实是 16 字节
         assert_eq!(std::mem::size_of::<Gfd>(), 16);
         assert_eq!(std::mem::align_of::<Gfd>(), 8);
     }
