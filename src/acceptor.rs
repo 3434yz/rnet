@@ -70,7 +70,7 @@ impl Acceptor {
 
             if let Some(handle) = self.workers.get(idx) {
                 let cmd = Command::Register(socket, local_addr.clone(), peer_addr);
-                if let Err(_e) = handle.command_sender.send(cmd) {
+                if let Err(_e) = handle.urgent_sender.send(cmd) {
                     eprintln!("Worker {} queue full, dropping connection", idx);
                     continue;
                 }

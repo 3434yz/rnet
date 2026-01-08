@@ -2,10 +2,30 @@ use crate::{gfd::Gfd, socket::Socket, socket_addr::NetworkAddress};
 
 pub enum Command {
     None,
-    Write(Gfd, Vec<u8>),
+    AsyncWrite(Gfd, Vec<u8>),
     Register(Socket, NetworkAddress, NetworkAddress),
     Close(usize),
-    Wake(),
+    Wake,
     IORead(usize),
     IOWrite(usize),
+}
+
+impl Command {
+    pub fn priority(&self) -> Prioity {
+        match self {
+            Command::None => Prioity::Low,
+            Command::AsyncWrite(_, _) => Prioity::High,
+            Command::Wake => Prioity::Low,
+            Command::Register(_, _, _) => Prioity::Low,
+            Command::Close(_) => Prioity::Low,
+            Command::IORead(_) => Prioity::High,
+            Command::IOWrite(_) => Prioity::High,
+        }
+    }
+}
+
+#[derive(PartialEq, PartialOrd)]
+pub enum Prioity {
+    High,
+    Low,
 }

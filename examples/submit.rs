@@ -1,3 +1,4 @@
+use crossbeam::epoch::Pointable;
 use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
@@ -32,7 +33,7 @@ impl EventHandler for MyHandler {
         }
         let gfd = conn.gfd();
         worker::submit(gfd, move || -> Command {
-            Command::Write(gfd, MyHandler::something())
+            Command::AsyncWrite(gfd, MyHandler::something())
         });
         Action::None
     }
