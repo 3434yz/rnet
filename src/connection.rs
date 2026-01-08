@@ -1,4 +1,5 @@
 use crate::command::Command;
+use crate::event_loop::EventLoopHandle;
 use crate::gfd::Gfd;
 use crate::io_buffer::IOBuffer;
 use crate::options::Options;
@@ -6,7 +7,6 @@ use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
 use bytes::{Buf, BytesMut};
-use crossbeam::channel::Sender;
 
 use std::io::{Read, Write};
 use std::ptr::NonNull;
@@ -20,7 +20,7 @@ pub struct Connection {
     pub(crate) closed: bool,
     pub(crate) in_buf: BytesMut,
     pub(crate) out_buf: BytesMut,
-    pub(crate) sender: Sender<Command>,
+    pub(crate) handle: Arc<EventLoopHandle>,
     buf_ptr: NonNull<IOBuffer>,
 }
 
@@ -31,7 +31,7 @@ impl Connection {
         options: Arc<Options>,
         local_addr: NetworkAddress,
         peer_addr: NetworkAddress,
-        sender: Sender<Command>,
+        handle: Arc<EventLoopHandle>,
         buf_ptr: NonNull<IOBuffer>,
     ) -> Self {
         Self {
@@ -42,7 +42,7 @@ impl Connection {
             closed: false,
             in_buf: BytesMut::with_capacity(options.read_buffer_cap),
             out_buf: BytesMut::with_capacity(options.write_buffer_cap),
-            sender,
+            handle,
             buf_ptr,
         }
     }
@@ -251,31 +251,14 @@ impl Connection {
         }
     }
 
-    pub(crate) fn peek_out(&self, n: Option<usize>) -> Option<&[u8]> {
-        let total_len = self.out_buf.len();
-        if total_len == 0 {
-            return None;
-        }
-
-        let actual_len = match n {
-            Some(n) if n > total_len => total_len,
-            Some(n) => n,
-            None => total_len,
-        };
-
-        Some(&self.out_buf[..actual_len])
-    }
-
-    pub(crate) fn advance_out(&self, n: Option<usize>) -> Option<usize> {
-        return Some(0);
-    }
-
     pub fn close(&mut self) {
-        let _ = self.sender.send(Command::Close(self.gfd.slab_index()));
+        let cmd = Command::Close(self.gfd.slab_index());
+        let _ = self.handle.trigger(cmd.priority(), cmd);
     }
 
     pub fn aysnc_write(&mut self, buf: Vec<u8>) {
-        let _ = self.sender.send(Command::Write(self.gfd, buf));
+        let cmd = Command::AsyncWrite(self.gfd, buf);
+        let _ = self.handle.trigger(cmd.priority(), cmd);
     }
 }
 

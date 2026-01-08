@@ -51,7 +51,7 @@ impl EventHandler for ChatRoomHandler {
                         if client_gfd != sender_gfd {
                             let msg_clone = msg.clone();
                             worker::submit(client_gfd, move || {
-                                Command::Write(client_gfd, msg_clone)
+                                Command::AsyncWrite(client_gfd, msg_clone)
                             });
                         }
                     }

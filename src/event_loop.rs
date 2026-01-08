@@ -1,4 +1,4 @@
-use crate::command::Command;
+use crate::command::{Command, Prioity};
 use crate::connection::Connection;
 use crate::gfd::Gfd;
 use crate::handler::{Action, EventHandler};
@@ -24,6 +24,8 @@ use std::time::Duration;
 const SERVER_TOKEN: Token = Token(usize::MAX);
 const WAKE_TOKEN: Token = Token(usize::MAX - 1);
 const EVENTS_CAP: usize = 1024;
+const MAX_POLL_EVENT_CAP: usize = 1024;
+const MAX_ASYNC_TASK_ONE_TIME: usize = 256;
 
 enum IoStatus {
     Completed,
@@ -45,7 +47,8 @@ pub(crate) struct EventLoopBuilder {}
 #[derive(Clone, Debug)]
 pub struct EventLoopHandle {
     pub idx: usize,
-    pub command_sender: Sender<Command>,
+    pub urgent_sender: Sender<Command>,
+    pub common_sender: Sender<Command>,
     pub waker: Arc<Waker>,
     pub conn_count: Arc<AtomicUsize>,
 }
@@ -53,13 +56,15 @@ pub struct EventLoopHandle {
 impl EventLoopHandle {
     pub fn new(
         idx: usize,
-        sender: Sender<Command>,
+        urgent_sender: Sender<Command>,
+        common_sender: Sender<Command>,
         waker: Arc<Waker>,
         conn_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             idx,
-            command_sender: sender,
+            urgent_sender,
+            common_sender,
             waker,
             conn_count,
         }
@@ -67,6 +72,25 @@ impl EventLoopHandle {
 
     pub fn connection_count(&self) -> usize {
         self.conn_count.load(Ordering::Relaxed)
+    }
+
+    pub fn trigger(&self, priority: Prioity, command: Command) -> io::Result<bool> {
+        let res;
+        if priority > Prioity::High && self.urgent_sender.len() >= MAX_POLL_EVENT_CAP {
+            res = self.common_sender.send(command);
+        } else {
+            res = self.urgent_sender.send(command);
+        }
+
+        if res.is_err() {
+            return Ok(false);
+        }
+
+        if self.waker.wake().is_err() {
+            return Ok(false);
+        } else {
+            return Ok(true);
+        }
     }
 }
 
@@ -76,16 +100,15 @@ where
 {
     pub loop_id: u8,
     poll: Poller,
-    waker: Arc<Waker>,
     listener: Option<Listener>,
     options: Arc<Options>,
     connections: Slab<Connection>,
     handler: Arc<H>,
     buffer: Box<IOBuffer>,
     cache: BytesMut,
-    inner_sender: Sender<Command>,
-    inner_receiver: Receiver<Command>,
-    conn_count: Arc<AtomicUsize>,
+    urgent_receiver: Receiver<Command>,
+    common_receiver: Receiver<Command>,
+    handle: Arc<EventLoopHandle>,
 }
 
 impl<H> EventLoop<H>
@@ -96,8 +119,10 @@ where
         loop_id: u8,
         options: Arc<Options>,
         handler: Arc<H>,
-        inner_sender: Sender<Command>,
-        inner_receiver: Receiver<Command>,
+        urgent_sender: Sender<Command>,
+        urgent_receiver: Receiver<Command>,
+        common_sender: Sender<Command>,
+        common_receiver: Receiver<Command>,
         conn_count: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poll = Poller::new()?;
@@ -105,6 +130,15 @@ where
         let buffer = Box::new(IOBuffer::new(options.read_buffer_cap));
         let cache = BytesMut::with_capacity(options.read_buffer_cap);
         let connections = Slab::with_capacity(4096);
+
+        let handle = EventLoopHandle::new(
+            loop_id as usize,
+            urgent_sender,
+            common_sender,
+            waker,
+            conn_count,
+        );
+        let handle = Arc::new(handle);
 
         Ok(Self {
             loop_id,
@@ -114,10 +148,9 @@ where
             handler,
             buffer,
             cache,
-            inner_sender,
-            inner_receiver,
-            waker,
-            conn_count,
+            urgent_receiver,
+            common_receiver,
+            handle,
             options,
         })
     }
@@ -145,14 +178,14 @@ where
         Ok(())
     }
 
-    pub(crate) fn get_waker(&self) -> Arc<Waker> {
-        self.waker.clone()
+    pub(crate) fn handle(&self) -> Arc<EventLoopHandle> {
+        self.handle.clone()
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(EVENTS_CAP);
         loop {
-            let timeout = if self.inner_receiver.is_empty() {
+            let timeout = if self.urgent_receiver.is_empty() {
                 None
             } else {
                 Some(Duration::ZERO)
@@ -169,7 +202,7 @@ where
                 match event.token() {
                     SERVER_TOKEN => self.accept_loop()?,
                     WAKE_TOKEN => {
-                        self.waker.reset();
+                        self.handle.waker.reset();
                         self.process_command()?
                     }
                     token => self.process_io(token, &event)?,
@@ -179,43 +212,48 @@ where
     }
 
     fn process_command(&mut self) -> io::Result<()> {
-        for _ in 0..1024 {
-            match self.inner_receiver.try_recv() {
-                Ok(c) => match c {
-                    Command::None => {}
-                    Command::Write(gfd, data) => {
-                        let loop_idx = gfd.event_loop_index();
-                        if loop_idx != self.loop_id as usize {
-                            eprintln!("Error: Received response for wrong engine {}", loop_idx);
-                            continue;
-                        }
-                        let token = gfd.slab_index();
-                        if let Some(conn) = self.connections.get_mut(token) {
-                            if conn.gfd != gfd {
-                                continue;
-                            }
-                            let _ = conn.write(&data);
-                        } else {
-                            continue;
-                        }
-
-                        self.write_socket(token)?;
-                        self.reregister(token)?;
-                    }
-                    Command::Register(socket, local_addr, peer_addr) => {
-                        self.register(socket, local_addr, peer_addr)?
-                    }
-                    Command::Close(key) => self.close_connection(key, true)?,
-                    Command::IORead(key) => {
-                        self.read_socket(key)?;
-                    }
-                    Command::IOWrite(key) => {
-                        self.write_socket(key)?;
-                    }
-                    Command::Wake() => {}
+        for _ in 0..MAX_ASYNC_TASK_ONE_TIME {
+            let command = match self.urgent_receiver.try_recv() {
+                Ok(c) => c,
+                Err(TryRecvError::Empty) => match self.common_receiver.try_recv() {
+                    Ok(c) => c,
+                    Err(_) => break,
                 },
-                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
+            };
+
+            match command {
+                Command::None => {}
+                Command::AsyncWrite(gfd, data) => {
+                    let loop_idx = gfd.event_loop_index();
+                    if loop_idx != self.loop_id as usize {
+                        eprintln!("Error: Received response for wrong engine {}", loop_idx);
+                        continue;
+                    }
+                    let token = gfd.slab_index();
+                    if let Some(conn) = self.connections.get_mut(token) {
+                        if conn.gfd != gfd {
+                            continue;
+                        }
+                        let _ = conn.write(&data);
+                    } else {
+                        continue;
+                    }
+
+                    self.write_socket(token)?;
+                    self.reregister(token)?;
+                }
+                Command::Register(socket, local_addr, peer_addr) => {
+                    self.register(socket, local_addr, peer_addr)?
+                }
+                Command::Close(key) => self.close_connection(key, true)?,
+                Command::IORead(key) => {
+                    self.read_socket(key)?;
+                }
+                Command::IOWrite(key) => {
+                    self.write_socket(key)?;
+                }
+                Command::Wake => self.handle.waker.wake()?,
             }
         }
         Ok(())
@@ -288,14 +326,14 @@ where
             self.options.clone(),
             local_addr,
             peer_addr,
-            self.inner_sender.clone(),
+            self.handle.clone(),
             ptr,
         );
         match self.handler.on_open(&mut conn) {
             Action::Close => self.close_connection(token.0, true)?,
             Action::None => {
                 entry.insert(conn);
-                self.conn_count.fetch_add(1, Ordering::Relaxed);
+                self.handle.conn_count.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -317,7 +355,7 @@ where
         let _ = self.poll.deregister(&mut conn.socket);
         self.connections.remove(key);
 
-        self.conn_count.fetch_sub(1, Ordering::Relaxed);
+        self.handle.conn_count.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -379,8 +417,7 @@ where
                 self.close_connection(key, graceful)?;
             }
             IoStatus::Yield => {
-                let _ = self.inner_sender.send(Command::IORead(key));
-                let _ = self.waker.wake();
+                let _ = self.trigger(Prioity::High, Command::IORead(key));
             }
             IoStatus::Completed => {}
         }
@@ -434,11 +471,14 @@ where
                 self.close_connection(key, graceful)?;
             }
             IoStatus::Yield => {
-                let _ = self.inner_sender.send(Command::IOWrite(key));
-                self.waker.wake()?;
+                let _ = self.trigger(Prioity::High, Command::IOWrite(key));
             }
             IoStatus::Completed => {}
         }
         Ok(())
+    }
+
+    fn trigger(&self, priority: Prioity, command: Command) -> io::Result<bool> {
+        self.handle.trigger(priority, command)
     }
 }

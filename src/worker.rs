@@ -1,8 +1,7 @@
 use crate::command::Command;
+use crate::event_loop::EventLoopHandle;
 use crate::gfd::Gfd;
-use crate::poller::Waker;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 
@@ -29,12 +28,12 @@ where
 }
 
 pub struct WorkerPool {
-    registry: Vec<(Sender<Command>, Arc<Waker>)>,
+    registry: Vec<EventLoopHandle>,
     receiver: Receiver<Task>,
 }
 
 impl WorkerPool {
-    pub fn new(registry: Vec<(Sender<Command>, Arc<Waker>)>) -> Self {
+    pub fn new(registry: Vec<EventLoopHandle>) -> Self {
         let (tx, rx) = unbounded();
         if GLOBAL_SENDER.set(tx).is_err() {
             eprintln!("Warning: WorkerPool initialized more than once");
@@ -61,13 +60,12 @@ impl WorkerPool {
 
                     let gfd = task.gfd;
                     let index = gfd.event_loop_index();
-
-                    if let Some((resp_sender, waker)) = reg.get(index) {
-                        if let Err(e) = resp_sender.send(command) {
+                    let priority = command.priority();
+                    if let Some(handle) = reg.get(index) {
+                        if let Err(e) = handle.trigger(priority, command) {
                             eprintln!("Worker {}: Failed to send response: {}", id, e);
                             continue;
                         }
-                        let _ = waker.wake();
                     }
                 }
                 println!("Worker {} stopped.", id);

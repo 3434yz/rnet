@@ -102,21 +102,22 @@ where
         let handler = self.handler.as_ref().unwrap().clone();
 
         for (idx, core_id) in worker_cores.into_iter().enumerate() {
-            let (inner_sender, inner_receiver) = crossbeam::channel::unbounded();
+            let (urgent_sender, urgent_receiver) = crossbeam::channel::unbounded();
+            let (common_sender, common_receiver) = crossbeam::channel::unbounded();
             let conn_count = Arc::new(AtomicUsize::new(0));
 
             let mut event_loop = EventLoop::new(
                 idx as u8,
                 self.options.clone(),
                 handler.clone(),
-                inner_sender.clone(),
-                inner_receiver,
-                conn_count.clone(),
+                urgent_sender,
+                urgent_receiver,
+                common_sender,
+                common_receiver,
+                conn_count,
             )?;
 
-            let handle =
-                EventLoopHandle::new(idx, inner_sender, event_loop.get_waker(), conn_count);
-            handles.push(handle);
+            handles.push((*event_loop.handle()).clone());
 
             let t = thread::spawn(move || {
                 if !core_affinity::set_for_current(core_id) {
@@ -130,10 +131,7 @@ where
         }
 
         // 构建 Registry，用于 WorkerPool 回传消息
-        let mut registry = Vec::new();
-        for h in &handles {
-            registry.push((h.command_sender.clone(), h.waker.clone()));
-        }
+        let registry = handles.clone();
 
         let balancer = self.lb_policy.take().unwrap();
         let mut acceptor = Acceptor::new(listener, handles, balancer)?;
@@ -166,14 +164,14 @@ where
         struct PendingLoop<H: EventHandler> {
             el: EventLoop<H>,
             core: core_affinity::CoreId,
-            loop_sender: crossbeam::channel::Sender<Command>,
-            waker: Arc<Waker>,
+            handle: EventLoopHandle,
         }
 
         let mut pending = Vec::new();
 
         for (idx, core_id) in worker_cores.into_iter().enumerate() {
-            let (inner_sender, inner_receiver) = crossbeam::channel::unbounded();
+            let (urgent_sender, urgent_receiver) = crossbeam::channel::unbounded();
+            let (common_sender, common_receiver) = crossbeam::channel::unbounded();
 
             let listener = Listener::bind(self.address[0].clone(), self.options.clone())?;
             let conn_count = Arc::new(AtomicUsize::new(0));
@@ -182,24 +180,26 @@ where
                 idx as u8,
                 self.options.clone(),
                 handler.clone(),
-                inner_sender.clone(),
-                inner_receiver,
+                urgent_sender,
+                urgent_receiver,
+                common_sender,
+                common_receiver,
                 conn_count,
             )?
             .listener(listener)
             .build()?;
 
-            let waker = event_loop.get_waker();
+            let handle = (*event_loop.handle()).clone();
+
             pending.push(PendingLoop {
                 el: event_loop,
                 core: core_id,
-                loop_sender: inner_sender,
-                waker,
+                handle: handle,
             });
         }
 
         for p in &pending {
-            registry.push((p.loop_sender.clone(), p.waker.clone()));
+            registry.push(p.handle.clone());
         }
 
         println!("Starting 4 Business Workers...");
