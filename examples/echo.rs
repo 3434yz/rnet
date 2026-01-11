@@ -6,6 +6,7 @@ use rnet::options::Options;
 use bytes::BytesMut;
 
 use std::io::Write;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct MyHandler {

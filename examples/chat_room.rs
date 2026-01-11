@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use rnet::command::Command;
 use rnet::connection::Connection;
-use rnet::engine::EngineBuilder;
+use rnet::engine::{EngineBuilder, EngineHandler};
 use rnet::gfd::Gfd;
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
@@ -11,12 +11,14 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct ChatRoomHandler {
+    engine: Option<EngineHandler>,
     clients: Arc<Mutex<HashSet<Gfd>>>,
 }
 
 impl ChatRoomHandler {
     fn new() -> Self {
         Self {
+            engine: None,
             clients: Arc::new(Mutex::new(HashSet::new())),
         }
     }

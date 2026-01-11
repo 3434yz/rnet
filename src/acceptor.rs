@@ -2,41 +2,41 @@ use crate::balancer::Balancer;
 use crate::command::Command;
 use crate::event_loop::EventLoopHandle;
 use crate::listener::Listener;
-use crate::socket_addr::NetworkAddress;
 
 use mio::{Events, Interest, Poll, Token};
-use std::io;
+use std::{io, sync::Arc};
 
-const ACCEPTOR_TOKEN: Token = Token(0);
+pub(crate) struct AcceptorHandle {}
 
 pub(crate) struct Acceptor {
     poll: Poll,
-    listener: Listener,
-    workers: Vec<EventLoopHandle>,
+    listeners: Vec<Listener>,
+    workers: Vec<Arc<EventLoopHandle>>,
     balancer: Balancer,
 }
 
 impl Acceptor {
     pub fn new(
-        listener: Listener,
-        workers: Vec<EventLoopHandle>,
+        listeners: Vec<Listener>,
+        workers: Vec<Arc<EventLoopHandle>>,
         balancer: Balancer,
     ) -> io::Result<Self> {
         let poll = Poll::new()?;
         Ok(Self {
             poll,
-            listener,
+            listeners,
             workers,
             balancer,
         })
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
-        self.poll
-            .registry()
-            .register(&mut self.listener, ACCEPTOR_TOKEN, Interest::READABLE)?;
+        for (idx, listener) in self.listeners.iter_mut().enumerate() {
+            self.poll
+                .registry()
+                .register(listener, Token(idx), Interest::READABLE)?;
+        }
 
-        let local_addr = self.listener.local_addr()?;
         let mut events = Events::with_capacity(128);
         loop {
             if let Err(e) = self.poll.poll(&mut events, None) {
@@ -47,17 +47,26 @@ impl Acceptor {
             }
 
             for event in events.iter() {
-                match event.token() {
-                    ACCEPTOR_TOKEN => self.accept_loop(&local_addr),
-                    _ => {}
+                let token = event.token();
+                if token.0 < self.listeners.len() {
+                    self.accept_loop(token.0);
                 }
             }
         }
     }
 
-    fn accept_loop(&mut self, local_addr: &NetworkAddress) {
+    fn accept_loop(&self, index: usize) {
+        let listener = &self.listeners[index];
+        let local_addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!("Failed to get local addr: {}", e);
+                return;
+            }
+        };
+
         loop {
-            let (socket, peer_addr) = match self.listener.accept() {
+            let (socket, peer_addr) = match listener.accept() {
                 Ok(res) => res,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {

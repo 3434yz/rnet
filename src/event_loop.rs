@@ -33,17 +33,6 @@ enum IoStatus {
     Closed(bool),
 }
 
-pub(crate) struct EventLoopBuilder {}
-
-// impl<H> EventLoopBuilder<H>
-// where
-//     H: EventHandler,
-// {
-//     fn build() -> (EventLoop<H>, EventLoopHandle<H>) {
-//         unimplemented!()
-//     }
-// }
-
 #[derive(Clone, Debug)]
 pub struct EventLoopHandle {
     pub idx: usize,
@@ -100,7 +89,7 @@ where
 {
     pub loop_id: u8,
     poll: Poller,
-    listener: Option<Listener>,
+    listeners: Option<Vec<Listener>>,
     options: Arc<Options>,
     connections: Slab<Connection>,
     handler: Arc<H>,
@@ -143,7 +132,7 @@ where
         Ok(Self {
             loop_id,
             poll,
-            listener: None,
+            listeners: None,
             connections,
             handler,
             buffer,
@@ -155,14 +144,16 @@ where
         })
     }
 
-    pub fn listener(mut self, listener: Listener) -> Self {
-        self.listener = Some(listener);
+    pub fn listener(mut self, listeners: Vec<Listener>) -> Self {
+        self.listeners = Some(listeners);
         self
     }
 
     pub fn build(mut self) -> io::Result<Self> {
-        if let Some(listener) = &mut self.listener {
-            self.poll.register(listener, SERVER_TOKEN)?;
+        if let Some(listeners) = &mut self.listeners {
+            for listener in listeners {
+                self.poll.register(listener, SERVER_TOKEN)?;
+            }
         }
         Ok(self)
     }
@@ -260,24 +251,35 @@ where
     }
 
     fn accept_loop(&mut self) -> io::Result<()> {
-        if self.listener.is_none() {
+        let Some(listeners) = self.listeners.take() else {
             return Ok(());
-        }
+        };
 
-        loop {
-            let listener = self.listener.as_mut().unwrap();
-            match listener.accept() {
-                Ok((socket, peer_addr)) => {
-                    let local_addr = listener.local_addr()?;
-                    self.register(socket, local_addr, peer_addr)?;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    eprintln!("Accept error: {}", e);
-                    break;
+        for listener in &listeners {
+            loop {
+                match listener.accept() {
+                    Ok((socket, peer_addr)) => {
+                        let local_addr = match listener.local_addr() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                self.listeners = Some(listeners);
+                                return Err(e);
+                            }
+                        };
+                        if let Err(e) = self.register(socket, local_addr, peer_addr) {
+                            self.listeners = Some(listeners);
+                            return Err(e);
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        eprintln!("Accept error: {}", e);
+                        break;
+                    }
                 }
             }
         }
+        self.listeners = Some(listeners);
         Ok(())
     }
 

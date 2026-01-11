@@ -2,7 +2,7 @@ use crate::command::Command;
 use crate::event_loop::EventLoopHandle;
 use crate::gfd::Gfd;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 static GLOBAL_SENDER: OnceLock<Sender<Task>> = OnceLock::new();
@@ -28,12 +28,12 @@ where
 }
 
 pub struct WorkerPool {
-    registry: Vec<EventLoopHandle>,
+    registry: Vec<Arc<EventLoopHandle>>,
     receiver: Receiver<Task>,
 }
 
 impl WorkerPool {
-    pub fn new(registry: Vec<EventLoopHandle>) -> Self {
+    pub fn new(registry: Vec<Arc<EventLoopHandle>>) -> Self {
         let (tx, rx) = unbounded();
         if GLOBAL_SENDER.set(tx).is_err() {
             eprintln!("Warning: WorkerPool initialized more than once");

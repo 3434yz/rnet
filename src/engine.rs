@@ -1,11 +1,9 @@
 use crate::acceptor::Acceptor;
 use crate::balancer::Balancer;
-use crate::command::Command;
 use crate::event_loop::{EventLoop, EventLoopHandle};
 use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
-use crate::poller::Waker;
 use crate::socket_addr::NetworkAddress;
 use crate::worker::WorkerPool;
 
@@ -82,32 +80,38 @@ where
     H: EventHandler,
 {
     pub fn run(&mut self) -> io::Result<()> {
-        let core_ids = get_core_ids(Some(self.options.num_event_loop));
+        let cores = get_core_ids(Some(self.options.num_event_loop));
 
-        println!("Engine starting with {} IO workers...", core_ids.len());
+        println!("Engine starting with {} IO workers...", cores.len());
 
         if self.options.reuse_port {
-            self.run_reuse_port(core_ids)
+            self.run_reuse_port(cores)
         } else {
-            self.run_user_lb(core_ids)
+            self.run_user_lb(cores)
         }
     }
 
-    fn run_user_lb(&mut self, worker_cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
+    fn run_user_lb(&mut self, cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
         println!("Engine runing user lb");
-        let listener = Listener::bind(self.address[0].clone(), self.options.clone())?;
-        let mut handles = Vec::new();
+
+        let listeners = self
+            .address
+            .iter()
+            .map(|addr| Listener::bind(addr.clone(), self.options.clone()))
+            .collect::<io::Result<Vec<Listener>>>()?;
+
+        let mut workers = Vec::new();
         let mut threads = Vec::new();
 
         let handler = self.handler.as_ref().unwrap().clone();
 
-        for (idx, core_id) in worker_cores.into_iter().enumerate() {
+        for (loop_id, core_id) in cores.into_iter().enumerate() {
             let (urgent_sender, urgent_receiver) = crossbeam::channel::unbounded();
             let (common_sender, common_receiver) = crossbeam::channel::unbounded();
             let conn_count = Arc::new(AtomicUsize::new(0));
 
             let mut event_loop = EventLoop::new(
-                idx as u8,
+                loop_id as u8,
                 self.options.clone(),
                 handler.clone(),
                 urgent_sender,
@@ -117,24 +121,24 @@ where
                 conn_count,
             )?;
 
-            handles.push((*event_loop.handle()).clone());
+            workers.push(event_loop.handle().clone());
 
             let t = thread::spawn(move || {
                 if !core_affinity::set_for_current(core_id) {
-                    eprintln!("EventLoop {} failed to pin to core", idx);
+                    eprintln!("EventLoop {} failed to pin to core", loop_id);
                 }
                 if let Err(e) = event_loop.run() {
-                    eprintln!("EventLoop {} failed: {}", idx, e);
+                    eprintln!("EventLoop {} failed: {}", loop_id, e);
                 }
             });
             threads.push(t);
         }
 
         // 构建 Registry，用于 WorkerPool 回传消息
-        let registry = handles.clone();
+        let registry = workers.clone();
 
         let balancer = self.lb_policy.take().unwrap();
-        let mut acceptor = Acceptor::new(listener, handles, balancer)?;
+        let mut acceptor = Acceptor::new(listeners, workers, balancer)?;
 
         println!("Starting Acceptor thread...");
         let acceptor_thread = thread::spawn(move || {
@@ -154,30 +158,34 @@ where
         Ok(())
     }
 
-    fn run_reuse_port(&mut self, worker_cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
+    fn run_reuse_port(&mut self, cores: Vec<core_affinity::CoreId>) -> io::Result<()> {
         println!("Engine runing kernel lb");
 
         let mut threads = Vec::new();
 
         let mut registry = Vec::new();
-        let handler = self.handler.as_ref().unwrap().clone();
+        let handler = self.handler.as_ref().expect("Handler is none").clone();
         struct PendingLoop<H: EventHandler> {
             el: EventLoop<H>,
             core: core_affinity::CoreId,
-            handle: EventLoopHandle,
+            handle: Arc<EventLoopHandle>,
         }
 
         let mut pending = Vec::new();
 
-        for (idx, core_id) in worker_cores.into_iter().enumerate() {
+        for (loop_id, core_id) in cores.into_iter().enumerate() {
             let (urgent_sender, urgent_receiver) = crossbeam::channel::unbounded();
             let (common_sender, common_receiver) = crossbeam::channel::unbounded();
 
-            let listener = Listener::bind(self.address[0].clone(), self.options.clone())?;
+            let listeners = self
+                .address
+                .iter()
+                .map(|addr| Listener::bind(addr.clone(), self.options.clone()))
+                .collect::<io::Result<Vec<_>>>()?;
             let conn_count = Arc::new(AtomicUsize::new(0));
 
             let event_loop = EventLoop::new(
-                idx as u8,
+                loop_id as u8,
                 self.options.clone(),
                 handler.clone(),
                 urgent_sender,
@@ -186,11 +194,10 @@ where
                 common_receiver,
                 conn_count,
             )?
-            .listener(listener)
+            .listener(listeners)
             .build()?;
 
-            let handle = (*event_loop.handle()).clone();
-
+            let handle = event_loop.handle().clone();
             pending.push(PendingLoop {
                 el: event_loop,
                 core: core_id,
@@ -226,10 +233,6 @@ where
         }
 
         Ok(())
-    }
-
-    pub fn handler(&mut self, handler: Arc<H>) {
-        self.handler = Some(handler.clone());
     }
 }
 
@@ -290,7 +293,11 @@ mod tests {
             .num_event_loop(8)
             .build();
 
-        let addrs = vec!["tcp://127.0.0.1:9000"];
+        let addrs = vec![
+            "tcp://127.0.0.1:9000",
+            "tcp://127.0.0.1:9001",
+            "tcp://127.0.0.1:9002",
+        ];
         let net_socket_addrs = options.normalize(&addrs).unwrap();
 
         let (mut engine, _handler_copy) =

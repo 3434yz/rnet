@@ -1,4 +1,3 @@
-use crossbeam::epoch::Pointable;
 use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
@@ -9,6 +8,7 @@ use rnet::worker;
 use bytes::BytesMut;
 
 use std::io::Write;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct MyHandler {
