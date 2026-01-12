@@ -8,6 +8,7 @@ pub enum Command {
     Wake,
     IORead(usize),
     IOWrite(usize),
+    Shutdown,
 }
 
 impl Command {
@@ -20,6 +21,7 @@ impl Command {
             Command::Close(_) => Prioity::Low,
             Command::IORead(_) => Prioity::High,
             Command::IOWrite(_) => Prioity::High,
+            Command::Shutdown => Prioity::High,
         }
     }
 }

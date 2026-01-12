@@ -5,7 +5,7 @@ use crate::handler::{Action, EventHandler};
 use crate::io_buffer::IOBuffer;
 use crate::listener::Listener;
 use crate::options::Options;
-use crate::poller::{Poller, Waker};
+use crate::poller::{Poller, WAKE_TOKEN, Waker};
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
@@ -21,8 +21,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-const SERVER_TOKEN: Token = Token(usize::MAX);
-const WAKE_TOKEN: Token = Token(usize::MAX - 1);
 const EVENTS_CAP: usize = 1024;
 const MAX_POLL_EVENT_CAP: usize = 1024;
 const MAX_ASYNC_TASK_ONE_TIME: usize = 256;
@@ -59,11 +57,17 @@ impl EventLoopHandle {
         }
     }
 
-    pub fn connection_count(&self) -> usize {
+    pub(crate) fn shutdown(&self) {
+        let command = Command::Shutdown;
+        let priority = Command::Shutdown.priority();
+        let _ = self.trigger(priority, command);
+    }
+
+    pub(crate) fn connection_count(&self) -> usize {
         self.conn_count.load(Ordering::Relaxed)
     }
 
-    pub fn trigger(&self, priority: Prioity, command: Command) -> io::Result<bool> {
+    pub(crate) fn trigger(&self, priority: Prioity, command: Command) -> io::Result<bool> {
         let res;
         if priority > Prioity::High && self.urgent_sender.len() >= MAX_POLL_EVENT_CAP {
             res = self.common_sender.send(command);
@@ -115,7 +119,7 @@ where
         conn_count: Arc<AtomicUsize>,
     ) -> io::Result<Self> {
         let poll = Poller::new()?;
-        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
+        let waker = Arc::new(Waker::new(poll.registry())?);
         let buffer = Box::new(IOBuffer::new(options.read_buffer_cap));
         let cache = BytesMut::with_capacity(options.read_buffer_cap);
         let connections = Slab::with_capacity(4096);
@@ -144,15 +148,16 @@ where
         })
     }
 
-    pub fn listener(mut self, listeners: Vec<Listener>) -> Self {
+    pub(crate) fn listener(mut self, listeners: Vec<Listener>) -> Self {
         self.listeners = Some(listeners);
         self
     }
 
-    pub fn build(mut self) -> io::Result<Self> {
+    pub(crate) fn build(mut self) -> io::Result<Self> {
         if let Some(listeners) = &mut self.listeners {
-            for listener in listeners {
-                self.poll.register(listener, SERVER_TOKEN)?;
+            for (i, listener) in listeners.iter_mut().enumerate() {
+                self.poll
+                    .register(listener, crate::poller::listener_token(i))?;
             }
         }
         Ok(self)
@@ -174,12 +179,20 @@ where
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
+        match self.run_loop() {
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+            other => other,
+        }
+    }
+
+    fn run_loop(&mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(EVENTS_CAP);
         loop {
-            let timeout = if self.urgent_receiver.is_empty() {
-                None
-            } else {
+            let has_pending = !self.urgent_receiver.is_empty() || !self.common_receiver.is_empty();
+            let timeout = if has_pending {
                 Some(Duration::ZERO)
+            } else {
+                None
             };
 
             if let Err(e) = self.poll.poll(&mut events, timeout) {
@@ -189,14 +202,19 @@ where
                 return Err(e);
             }
 
+            if has_pending {
+                self.process_command()?;
+            }
+
             for event in events.iter() {
-                match event.token() {
-                    SERVER_TOKEN => self.accept_loop()?,
-                    WAKE_TOKEN => {
-                        self.handle.waker.reset();
-                        self.process_command()?
-                    }
-                    token => self.process_io(token, &event)?,
+                let token = event.token();
+                if token == WAKE_TOKEN {
+                    self.handle.waker.reset();
+                    self.process_command()?;
+                } else if let Some(idx) = crate::poller::is_listener_token(token) {
+                    self.accept_process(idx)?;
+                } else {
+                    self.process_io(token, &event)?;
                 }
             }
         }
@@ -245,17 +263,24 @@ where
                     self.write_socket(key)?;
                 }
                 Command::Wake => self.handle.waker.wake()?,
+                Command::Shutdown => {
+                    self.shutdown();
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "EventLoop Shutdown",
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    fn accept_loop(&mut self) -> io::Result<()> {
+    fn accept_process(&mut self, idx: usize) -> io::Result<()> {
         let Some(listeners) = self.listeners.take() else {
             return Ok(());
         };
 
-        for listener in &listeners {
+        if let Some(listener) = listeners.get(idx) {
             loop {
                 match listener.accept() {
                     Ok((socket, peer_addr)) => {
@@ -310,8 +335,12 @@ where
         local_addr: NetworkAddress,
         peer_addr: NetworkAddress,
     ) -> io::Result<()> {
-        if let Err(e) = socket.set_nodelay(true) {
-            eprintln!("set_nodelay failed: {}", e);
+        use crate::options::TcpSocketOpt;
+
+        if matches!(self.options.tcp_no_delay, TcpSocketOpt::NoDelay) {
+            if let Err(e) = socket.set_nodelay(true) {
+                eprintln!("set_nodelay failed: {}", e);
+            }
         }
 
         let entry = self.connections.vacant_entry();
@@ -337,6 +366,13 @@ where
                 entry.insert(conn);
                 self.handle.conn_count.fetch_add(1, Ordering::Relaxed);
             }
+            Action::Shutdown => {
+                self.shutdown();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "EventLoop Shutdown",
+                ));
+            }
         }
         Ok(())
     }
@@ -354,7 +390,7 @@ where
         }
 
         self.handler.on_close(conn);
-        let _ = self.poll.deregister(&mut conn.socket);
+        self.poll.deregister(&mut conn.socket)?;
         self.connections.remove(key);
 
         self.handle.conn_count.fetch_sub(1, Ordering::Relaxed);
@@ -394,6 +430,13 @@ where
                         Action::Close => {
                             status = IoStatus::Closed(true);
                             break;
+                        }
+                        Action::Shutdown => {
+                            self.shutdown();
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "EventLoop Shutdown",
+                            ));
                         }
                     }
 
@@ -482,5 +525,18 @@ where
 
     fn trigger(&self, priority: Prioity, command: Command) -> io::Result<bool> {
         self.handle.trigger(priority, command)
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut listeners) = self.listeners.take() {
+            for listener in &mut listeners {
+                let _ = self.poll.deregister(listener);
+            }
+        }
+
+        let keys: Vec<usize> = self.connections.iter().map(|(k, _)| k).collect();
+        for key in keys {
+            let _ = self.close_connection(key, true);
+        }
     }
 }

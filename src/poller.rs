@@ -4,6 +4,21 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+pub const WAKE_TOKEN: Token = Token(usize::MAX);
+const LISTENER_TOKEN_START: usize = usize::MAX - 1024;
+
+pub fn listener_token(index: usize) -> Token {
+    Token(LISTENER_TOKEN_START + index)
+}
+
+pub fn is_listener_token(token: Token) -> Option<usize> {
+    if token.0 >= LISTENER_TOKEN_START && token.0 < usize::MAX {
+        Some(token.0 - LISTENER_TOKEN_START)
+    } else {
+        None
+    }
+}
+
 pub struct Poller {
     poll: Poll,
 }
@@ -63,8 +78,8 @@ pub struct Waker {
 }
 
 impl Waker {
-    pub fn new(registry: &Registry, token: Token) -> io::Result<Self> {
-        let waker = MioWaker::new(registry, token)?;
+    pub fn new(registry: &Registry) -> io::Result<Self> {
+        let waker = MioWaker::new(registry, WAKE_TOKEN)?;
         Ok(Self {
             waker,
             awoken: AtomicBool::new(false),

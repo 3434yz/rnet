@@ -1,4 +1,4 @@
-use crate::acceptor::Acceptor;
+use crate::acceptor::{Acceptor, AcceptorHandle};
 use crate::balancer::Balancer;
 use crate::event_loop::{EventLoop, EventLoopHandle};
 use crate::handler::EventHandler;
@@ -8,6 +8,7 @@ use crate::socket_addr::NetworkAddress;
 use crate::worker::WorkerPool;
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::{io, thread};
 
@@ -24,13 +25,17 @@ impl EngineBuilder {
         }
     }
 
-    pub fn build<H, F>(self, options: Options, handler_factory: F) -> (Engine<H>, EngineHandler)
+    pub fn build<H, F>(
+        self,
+        options: Options,
+        handler_factory: F,
+    ) -> (Engine<H>, Arc<EngineHandler>)
     where
         H: EventHandler,
-        F: FnOnce(EngineHandler) -> H,
+        F: FnOnce(Arc<EngineHandler>) -> H,
     {
         let options = Arc::new(options);
-        let engine_handler = EngineHandler {};
+        let engine_handler = Arc::new(EngineHandler::new());
         let handler = handler_factory(engine_handler.clone());
 
         let lb_policy = if options.reuse_port {
@@ -44,6 +49,7 @@ impl EngineBuilder {
             options: options.clone(),
             handler: Some(Arc::new(handler)),
             lb_policy,
+            handle: engine_handler.clone(),
         };
         (engine, engine_handler)
     }
@@ -59,12 +65,37 @@ impl EngineBuilder {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct EngineHandler {}
+#[derive(Debug)]
+pub struct EngineHandler {
+    acceptor: OnceLock<AcceptorHandle>,
+    workers: OnceLock<Vec<Arc<EventLoopHandle>>>,
+}
 
 impl EngineHandler {
     pub(crate) fn new() -> Self {
-        Self {}
+        Self {
+            acceptor: OnceLock::new(),
+            workers: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn set_acceptor(&self, acceptor: AcceptorHandle) {
+        let _ = self.acceptor.set(acceptor);
+    }
+
+    pub(crate) fn set_workers(&self, workers: Vec<Arc<EventLoopHandle>>) {
+        let _ = self.workers.set(workers);
+    }
+
+    pub fn shutdown(&self) {
+        if let Some(acceptor) = self.acceptor.get() {
+            acceptor.shutdown();
+        }
+        if let Some(workers) = self.workers.get() {
+            for worker in workers {
+                worker.shutdown();
+            }
+        }
     }
 }
 
@@ -73,6 +104,7 @@ pub struct Engine<H: EventHandler> {
     address: Vec<NetworkAddress>,
     options: Arc<Options>,
     lb_policy: Option<Balancer>,
+    handle: Arc<EngineHandler>,
 }
 
 impl<H> Engine<H>
@@ -134,11 +166,13 @@ where
             threads.push(t);
         }
 
-        // 构建 Registry，用于 WorkerPool 回传消息
         let registry = workers.clone();
 
+        self.handle.set_workers(registry.clone());
+
         let balancer = self.lb_policy.take().unwrap();
-        let mut acceptor = Acceptor::new(listeners, workers, balancer)?;
+        let (mut acceptor, acceptor_handle) = Acceptor::new(listeners, workers, balancer)?;
+        self.handle.set_acceptor(acceptor_handle);
 
         println!("Starting Acceptor thread...");
         let acceptor_thread = thread::spawn(move || {
@@ -208,6 +242,7 @@ where
         for p in &pending {
             registry.push(p.handle.clone());
         }
+        self.handle.set_workers(registry.clone());
 
         println!("Starting 4 Business Workers...");
         let worker_pool = WorkerPool::new(registry);
@@ -244,14 +279,20 @@ mod tests {
     use crate::options::Options;
     use bytes::BytesMut;
 
-    #[derive(Clone, Copy)]
+    use std::sync::Arc;
+
+    #[derive(Clone)]
     struct GameServer {
-        engine: Option<EngineHandler>,
+        engine: Arc<EngineHandler>,
     }
 
     impl EventHandler for GameServer {
         fn on_open(&self, _conn: &mut Connection) -> Action {
             println!("New Connect");
+            if let Some(workers) = self.engine.workers.get() {
+                println!("Workers length: {}", workers.len());
+            }
+
             Action::None
         }
 
@@ -272,14 +313,18 @@ mod tests {
             .num_event_loop(8)
             .build();
 
-        let addrs = vec!["tcp://127.0.0.1:9000"];
+        let addrs = vec![
+            "tcp://127.0.0.1:9000",
+            "tcp://127.0.0.1:9001",
+            "tcp://127.0.0.1:9002",
+        ];
         let net_socket_addrs = options.normalize(&addrs).unwrap();
 
         let (mut engine, _handler_copy) =
             EngineBuilder::builder()
                 .address(net_socket_addrs)
                 .build(options, |engine_handler| GameServer {
-                    engine: Some(engine_handler),
+                    engine: engine_handler,
                 });
 
         engine.run().expect("run failed");
@@ -304,7 +349,7 @@ mod tests {
             EngineBuilder::builder()
                 .address(net_socket_addrs)
                 .build(options, |engine_handler| GameServer {
-                    engine: Some(engine_handler),
+                    engine: engine_handler,
                 });
 
         engine.run().expect("run failed");
