@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct ChatRoomHandler {
-    engine: Option<EngineHandler>,
+    engine: Option<Arc<EngineHandler>>,
     clients: Arc<Mutex<HashSet<Gfd>>>,
 }
 
 impl ChatRoomHandler {
-    fn new() -> Self {
+    fn new(engine: Arc<EngineHandler>) -> Self {
         Self {
-            engine: None,
+            engine: Some(engine),
             clients: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -49,11 +49,16 @@ impl EventHandler for ChatRoomHandler {
 
                     // Broadcast to other clients
                     let clients = self.clients.lock().unwrap();
+                    let engine = self.engine.clone().unwrap();
                     for &client_gfd in clients.iter() {
                         if client_gfd != sender_gfd {
                             let msg_clone = msg.clone();
-                            worker::submit(client_gfd, move || {
-                                Command::AsyncWrite(client_gfd, msg_clone)
+                            let engine = engine.clone();
+                            worker::submit(move || {
+                                engine.send_command(
+                                    client_gfd,
+                                    Command::AsyncWrite(client_gfd, msg_clone),
+                                );
                             });
                         }
                     }
@@ -84,7 +89,7 @@ fn main() {
 
     let (mut engine, _handler) = EngineBuilder::builder()
         .address(net_socket_addrs)
-        .build(options, |_| ChatRoomHandler::new());
+        .build(options, |engine| ChatRoomHandler::new(engine));
 
     println!("Chat room server running on tcp://127.0.0.1:8888");
     engine.run().expect("run failed");

@@ -1,6 +1,8 @@
 use crate::acceptor::{Acceptor, AcceptorHandle};
 use crate::balancer::Balancer;
+use crate::command::Command;
 use crate::event_loop::{EventLoop, EventLoopHandle};
+use crate::gfd::Gfd;
 use crate::handler::EventHandler;
 use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
@@ -85,6 +87,16 @@ impl EngineHandler {
 
     pub(crate) fn set_workers(&self, workers: Vec<Arc<EventLoopHandle>>) {
         let _ = self.workers.set(workers);
+    }
+
+    pub fn send_command(&self, gfd: Gfd, command: Command) {
+        if let Some(workers) = self.workers.get() {
+            let idx = gfd.event_loop_index();
+            if let Some(worker) = workers.get(idx) {
+                let priority = command.priority();
+                let _ = worker.trigger(priority, command);
+            }
+        }
     }
 
     pub fn shutdown(&self) {
@@ -182,7 +194,7 @@ where
         });
         threads.push(acceptor_thread);
 
-        let worker_pool = WorkerPool::new(registry);
+        let worker_pool = WorkerPool::new();
         worker_pool.run(4);
 
         for t in threads {
@@ -245,7 +257,7 @@ where
         self.handle.set_workers(registry.clone());
 
         println!("Starting 4 Business Workers...");
-        let worker_pool = WorkerPool::new(registry);
+        let worker_pool = WorkerPool::new();
         worker_pool.run(4);
 
         for p in pending {

@@ -10,9 +10,9 @@ use bytes::BytesMut;
 use std::io::Write;
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MyHandler {
-    engine: Option<EngineHandler>,
+    engine: Option<Arc<EngineHandler>>,
 }
 
 impl MyHandler {
@@ -32,9 +32,12 @@ impl EventHandler for MyHandler {
             let _ = conn.write(datas);
         }
         let gfd = conn.gfd();
-        worker::submit(gfd, move || -> Command {
-            Command::AsyncWrite(gfd, MyHandler::something())
-        });
+        if let Some(engine) = &self.engine {
+            let engine = engine.clone();
+            worker::submit(move || {
+                engine.send_command(gfd, Command::AsyncWrite(gfd, MyHandler::something()));
+            });
+        }
         Action::None
     }
 

@@ -1,24 +1,19 @@
-use crate::command::Command;
-use crate::event_loop::EventLoopHandle;
-use crate::gfd::Gfd;
 use crossbeam::channel::{Receiver, Sender, unbounded};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::thread;
 
 static GLOBAL_SENDER: OnceLock<Sender<Task>> = OnceLock::new();
 
 pub struct Task {
-    gfd: Gfd,
-    closure: Box<dyn FnOnce() -> Command + Send>,
+    closure: Box<dyn FnOnce() + Send>,
 }
 
-pub fn submit<F>(gfd: Gfd, f: F)
+pub fn submit<F>(f: F)
 where
-    F: FnOnce() -> Command + Send + 'static,
+    F: FnOnce() + Send + 'static,
 {
     if let Some(sender) = GLOBAL_SENDER.get() {
         let task = Task {
-            gfd,
             closure: Box::new(f),
         };
         let _ = sender.send(task);
@@ -28,45 +23,26 @@ where
 }
 
 pub struct WorkerPool {
-    registry: Vec<Arc<EventLoopHandle>>,
     receiver: Receiver<Task>,
 }
 
 impl WorkerPool {
-    pub fn new(registry: Vec<Arc<EventLoopHandle>>) -> Self {
+    pub fn new() -> Self {
         let (tx, rx) = unbounded();
         if GLOBAL_SENDER.set(tx).is_err() {
             eprintln!("Warning: WorkerPool initialized more than once");
         }
-        Self {
-            registry,
-            receiver: rx,
-        }
+        Self { receiver: rx }
     }
 
     pub fn run(self, count: usize) {
         let receiver = self.receiver;
-        let registry = self.registry;
 
         for id in 0..count {
             let rx = receiver.clone();
-            let reg = registry.clone();
             thread::spawn(move || {
                 while let Ok(task) = rx.recv() {
-                    let command = (task.closure)();
-                    if let Command::None = command {
-                        continue;
-                    }
-
-                    let gfd = task.gfd;
-                    let index = gfd.event_loop_index();
-                    let priority = command.priority();
-                    if let Some(handle) = reg.get(index) {
-                        if let Err(e) = handle.trigger(priority, command) {
-                            eprintln!("Worker {}: Failed to send response: {}", id, e);
-                            continue;
-                        }
-                    }
+                    (task.closure)();
                 }
                 println!("Worker {} stopped.", id);
             });

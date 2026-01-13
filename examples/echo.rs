@@ -8,9 +8,9 @@ use bytes::BytesMut;
 use std::io::Write;
 use std::sync::Arc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MyHandler {
-    engine: Option<EngineHandler>,
+    engine: Option<Arc<EngineHandler>>,
 }
 
 impl EventHandler for MyHandler {
