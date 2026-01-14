@@ -5,7 +5,7 @@ use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 use rnet::worker;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use std::io::Write;
 use std::sync::Arc;
@@ -31,12 +31,16 @@ impl EventHandler for MyHandler {
         if let Some(datas) = conn.znext(None, cache) {
             let _ = conn.write(datas);
         }
-        let gfd = conn.gfd();
         if let Some(engine) = &self.engine {
+            let gfd = conn.gfd();
             let engine = engine.clone();
-            worker::submit(move || {
-                engine.send_command(gfd, Command::AsyncWrite(gfd, MyHandler::something()));
-            });
+            worker::submit(
+                move || {
+                    let datas = Bytes::from(MyHandler::something());
+                    engine.send_command(gfd, Command::AsyncWrite(gfd, datas));
+                },
+                gfd.event_loop_index(),
+            );
         }
         Action::None
     }

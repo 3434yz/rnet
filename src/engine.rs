@@ -70,14 +70,14 @@ impl EngineBuilder {
 #[derive(Debug)]
 pub struct EngineHandler {
     acceptor: OnceLock<AcceptorHandle>,
-    workers: OnceLock<Vec<Arc<EventLoopHandle>>>,
+    eventloops: OnceLock<Vec<Arc<EventLoopHandle>>>,
 }
 
 impl EngineHandler {
     pub(crate) fn new() -> Self {
         Self {
             acceptor: OnceLock::new(),
-            workers: OnceLock::new(),
+            eventloops: OnceLock::new(),
         }
     }
 
@@ -85,16 +85,16 @@ impl EngineHandler {
         let _ = self.acceptor.set(acceptor);
     }
 
-    pub(crate) fn set_workers(&self, workers: Vec<Arc<EventLoopHandle>>) {
-        let _ = self.workers.set(workers);
+    pub(crate) fn set_workers(&self, eventloops: Vec<Arc<EventLoopHandle>>) {
+        let _ = self.eventloops.set(eventloops);
     }
 
     pub fn send_command(&self, gfd: Gfd, command: Command) {
-        if let Some(workers) = self.workers.get() {
+        if let Some(eventloops) = self.eventloops.get() {
             let idx = gfd.event_loop_index();
-            if let Some(worker) = workers.get(idx) {
+            if let Some(eventloop) = eventloops.get(idx) {
                 let priority = command.priority();
-                let _ = worker.trigger(priority, command);
+                let _ = eventloop.trigger(priority, command);
             }
         }
     }
@@ -103,9 +103,9 @@ impl EngineHandler {
         if let Some(acceptor) = self.acceptor.get() {
             acceptor.shutdown();
         }
-        if let Some(workers) = self.workers.get() {
-            for worker in workers {
-                worker.shutdown();
+        if let Some(eventloops) = self.eventloops.get() {
+            for eventloop in eventloops {
+                eventloop.shutdown();
             }
         }
     }
@@ -194,8 +194,8 @@ where
         });
         threads.push(acceptor_thread);
 
-        let worker_pool = WorkerPool::new();
-        worker_pool.run(4);
+        let worker_pool = WorkerPool::new(4);
+        // worker_pool.run(4);
 
         for t in threads {
             t.join().unwrap();
@@ -208,7 +208,7 @@ where
         println!("Engine runing kernel lb");
 
         let mut threads = Vec::new();
-
+        let worker_count = cores.len();
         let mut registry = Vec::new();
         let handler = self.handler.as_ref().expect("Handler is none").clone();
         struct PendingLoop<H: EventHandler> {
@@ -256,9 +256,8 @@ where
         }
         self.handle.set_workers(registry.clone());
 
-        println!("Starting 4 Business Workers...");
-        let worker_pool = WorkerPool::new();
-        worker_pool.run(4);
+        println!("Starting {} Business Workers...", worker_count);
+        WorkerPool::new(worker_count);
 
         for p in pending {
             let mut el = p.el;
@@ -301,7 +300,7 @@ mod tests {
     impl EventHandler for GameServer {
         fn on_open(&self, _conn: &mut Connection) -> Action {
             println!("New Connect");
-            if let Some(workers) = self.engine.workers.get() {
+            if let Some(workers) = self.engine.eventloops.get() {
                 println!("Workers length: {}", workers.len());
             }
 

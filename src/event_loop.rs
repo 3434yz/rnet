@@ -165,10 +165,10 @@ where
 
     fn reregister(&mut self, key: usize) -> io::Result<()> {
         if let Some(conn) = self.connections.get_mut(key) {
-            if !conn.out_buf.is_empty() {
-                self.poll.enable_write(&mut conn.socket, Token(key))?;
-            } else {
+            if conn.out_buf.is_empty() {
                 self.poll.disable_write(&mut conn.socket, Token(key))?;
+            } else {
+                self.poll.enable_write(&mut conn.socket, Token(key))?;
             }
         }
         Ok(())
@@ -240,16 +240,18 @@ where
                         continue;
                     }
                     let token = gfd.slab_index();
-                    if let Some(conn) = self.connections.get_mut(token) {
-                        if conn.gfd != gfd {
-                            continue;
-                        }
-                        let _ = conn.write(&data);
-                    } else {
+                    let Some(conn) = self.connections.get_mut(token) else {
+                        continue;
+                    };
+                    if conn.gfd != gfd {
                         continue;
                     }
 
-                    self.write_socket(token)?;
+                    if conn.write(&data).is_err() {
+                        self.close_connection(token, false)?;
+                        continue;
+                    }
+
                     self.reregister(token)?;
                 }
                 Command::Register(socket, local_addr, peer_addr) => {

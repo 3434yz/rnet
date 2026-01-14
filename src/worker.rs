@@ -1,51 +1,55 @@
-use crossbeam::channel::{Receiver, Sender, unbounded};
+use crossbeam::channel::{Receiver, Sender, bounded};
 use std::sync::OnceLock;
 use std::thread;
 
-static GLOBAL_SENDER: OnceLock<Sender<Task>> = OnceLock::new();
+// 1. 改为存储一组 Senders
+static GLOBAL_SENDERS: OnceLock<Vec<Sender<Task>>> = OnceLock::new();
 
 pub struct Task {
-    closure: Box<dyn FnOnce() + Send>,
+    pub closure: Box<dyn FnOnce() + Send>,
 }
 
-pub fn submit<F>(f: F)
+pub fn submit<F>(f: F, shard_idx: usize)
 where
     F: FnOnce() + Send + 'static,
 {
-    if let Some(sender) = GLOBAL_SENDER.get() {
+    if let Some(senders) = GLOBAL_SENDERS.get() {
         let task = Task {
             closure: Box::new(f),
         };
-        let _ = sender.send(task);
+        let idx = shard_idx % senders.len();
+        let _ = senders[idx].send(task);
     } else {
-        eprintln!("WorkerPool not initialized, task dropped");
+        eprintln!("WorkerPool not initialized");
     }
 }
 
-pub struct WorkerPool {
-    receiver: Receiver<Task>,
-}
+pub struct WorkerPool {}
 
 impl WorkerPool {
-    pub fn new() -> Self {
-        let (tx, rx) = unbounded();
-        if GLOBAL_SENDER.set(tx).is_err() {
-            eprintln!("Warning: WorkerPool initialized more than once");
-        }
-        Self { receiver: rx }
-    }
+    pub fn new(worker_count: usize) -> Self {
+        let mut senders: Vec<Sender<Task>> = Vec::with_capacity(worker_count);
 
-    pub fn run(self, count: usize) {
-        let receiver = self.receiver;
+        for id in 0..worker_count {
+            let (tx, rx) = bounded(10000);
+            senders.push(tx);
 
-        for id in 0..count {
-            let rx = receiver.clone();
             thread::spawn(move || {
                 while let Ok(task) = rx.recv() {
                     (task.closure)();
+
+                    while let Ok(next_task) = rx.try_recv() {
+                        (next_task.closure)();
+                    }
                 }
                 println!("Worker {} stopped.", id);
             });
         }
+
+        if GLOBAL_SENDERS.set(senders).is_err() {
+            eprintln!("Warning: WorkerPool initialized twice");
+        }
+
+        Self {}
     }
 }

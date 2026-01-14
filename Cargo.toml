@@ -10,6 +10,7 @@ slab = "0.4"
 core_affinity = "0.8"
 bytes = "1.11.0"
 crossbeam = "0.8.4"
+mimalloc = "0.1.48"
 
 # === 关键性能配置 ===
 [profile.release]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub enum Action {
     None,
     Close,
-    Shutdown, // 发送shutdown command
+    Shutdown,
 }
 
 pub trait EventHandler: Send + Sync + 'static {

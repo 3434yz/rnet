@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
-use rnet::gfd::Gfd;
+use rnet::gfd::{self, Gfd};
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 use rnet::worker;
@@ -41,31 +41,33 @@ impl EventHandler for ChatRoomHandler {
                 }
             }
 
-            if let Some(len) = found_len {
-                // Consume the line
-                if let Some(data) = conn.znext(Some(len), cache) {
-                    let msg = data.to_vec();
-                    let sender_gfd = conn.gfd();
-
-                    // Broadcast to other clients
-                    let clients = self.clients.lock().unwrap();
-                    let engine = self.engine.clone().unwrap();
-                    for &client_gfd in clients.iter() {
-                        if client_gfd != sender_gfd {
-                            let msg_clone = msg.clone();
-                            let engine = engine.clone();
-                            worker::submit(move || {
-                                engine.send_command(
-                                    client_gfd,
-                                    Command::AsyncWrite(client_gfd, msg_clone),
-                                );
-                            });
-                        }
-                    }
-                }
-            } else {
-                // No complete line found
+            let Some(len) = found_len else {
                 break;
+            };
+            if let Some(data) = conn.next(Some(len), cache) {
+                let msg = data.freeze();
+                let sender_gfd = conn.gfd();
+
+                let clients_guard = self.clients.lock().unwrap();
+                let target_clients: Vec<Gfd> = clients_guard
+                    .iter()
+                    .filter(|&&c| c != sender_gfd)
+                    .cloned()
+                    .collect();
+                drop(clients_guard); // 尽早释放锁
+
+                let engine = self.engine.clone().unwrap();
+                worker::submit(
+                    move || {
+                        for client_gfd in target_clients {
+                            engine.send_command(
+                                client_gfd,
+                                Command::AsyncWrite(client_gfd, msg.clone()),
+                            );
+                        }
+                    },
+                    sender_gfd.event_loop_index(),
+                );
             }
         }
         Action::None

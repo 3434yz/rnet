@@ -6,7 +6,7 @@ use crate::options::Options;
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use std::io::{Read, Write};
 use std::ptr::NonNull;
@@ -256,9 +256,13 @@ impl Connection {
         let _ = self.handle.trigger(cmd.priority(), cmd);
     }
 
-    pub fn aysnc_write(&mut self, buf: Vec<u8>) {
+    pub fn aysnc_write(&mut self, buf: Bytes) {
         let cmd = Command::AsyncWrite(self.gfd, buf);
         let _ = self.handle.trigger(cmd.priority(), cmd);
+    }
+
+    pub fn buffer_write(&mut self, buf: &[u8]) {
+        self.out_buf.extend_from_slice(buf);
     }
 }
 

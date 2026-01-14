@@ -1,8 +1,10 @@
+use bytes::Bytes;
+
 use crate::{gfd::Gfd, socket::Socket, socket_addr::NetworkAddress};
 
 pub enum Command {
     None,
-    AsyncWrite(Gfd, Vec<u8>),
+    AsyncWrite(Gfd, Bytes),
     Register(Socket, NetworkAddress, NetworkAddress),
     Close(usize),
     Wake,
