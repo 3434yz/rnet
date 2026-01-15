@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
-use rnet::gfd::{self, Gfd};
+use rnet::gfd::Gfd;
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 use rnet::worker;

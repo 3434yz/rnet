@@ -8,6 +8,11 @@ use bytes::BytesMut;
 use std::io::Write;
 use std::sync::Arc;
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[derive(Clone)]
 struct MyHandler {
     engine: Option<Arc<EngineHandler>>,
