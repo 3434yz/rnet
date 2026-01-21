@@ -16,7 +16,6 @@ use mio::{Events, Token};
 use slab::Slab;
 
 use std::io::{self, Read, Write};
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -97,8 +96,7 @@ where
     options: Arc<Options>,
     connections: Slab<Connection>,
     handler: Arc<H>,
-    buffer: Box<IOBuffer>,
-    cache: BytesMut,
+    io_buffer: BytesMut,
     urgent_receiver: Receiver<Command>,
     common_receiver: Receiver<Command>,
     handle: Arc<EventLoopHandle>,
@@ -120,8 +118,8 @@ where
     ) -> io::Result<Self> {
         let poll = Poller::new()?;
         let waker = Arc::new(Waker::new(poll.registry())?);
-        let buffer = Box::new(IOBuffer::new(options.read_buffer_cap));
-        let cache = BytesMut::with_capacity(options.read_buffer_cap);
+        // let buffer = Some(IOBuffer::new(options.read_buffer_cap));
+        let io_buffer = BytesMut::with_capacity(options.read_buffer_cap);
         let connections = Slab::with_capacity(4096);
 
         let handle = EventLoopHandle::new(
@@ -139,8 +137,7 @@ where
             listeners: None,
             connections,
             handler,
-            buffer,
-            cache,
+            io_buffer,
             urgent_receiver,
             common_receiver,
             handle,
@@ -350,8 +347,6 @@ where
 
         self.poll.register(&mut socket, token)?;
 
-        let raw_ptr = self.buffer.as_mut() as *mut IOBuffer;
-        let ptr = NonNull::new(raw_ptr).expect("create ptr error");
         let gfd = Gfd::new(socket.fd(), self.loop_id, token.0);
         let mut conn = Connection::new(
             gfd,
@@ -360,7 +355,6 @@ where
             local_addr,
             peer_addr,
             self.handle.clone(),
-            ptr,
         );
         match self.handler.on_open(&mut conn) {
             Action::Close => self.close_connection(token.0, true)?,
@@ -418,16 +412,24 @@ where
                 status = IoStatus::Yield;
                 break;
             }
+            let read_buffer_cap = self.options.read_buffer_cap;
+            if self.io_buffer.capacity() < read_buffer_cap {
+                self.io_buffer.reserve(read_buffer_cap);
+            }
+            if self.io_buffer.len() < read_buffer_cap {
+                unsafe { self.io_buffer.set_len(read_buffer_cap) };
+            }
 
-            match conn.socket.read(&mut self.buffer) {
+            match conn.socket.read(&mut self.io_buffer) {
                 Ok(0) => {
                     status = IoStatus::Closed(true);
                     break;
                 }
                 Ok(n) => {
                     bytes_read += n;
-                    self.buffer.read(n);
-                    match self.handler.on_traffic(conn, &mut self.cache) {
+                    let io_buffer = self.io_buffer.split_to(n);
+                    conn.io_buffer = Some(io_buffer);
+                    match self.handler.on_traffic(conn) {
                         Action::None => {}
                         Action::Close => {
                             status = IoStatus::Closed(true);
@@ -442,11 +444,13 @@ where
                         }
                     }
 
-                    if self.buffer.remaining() > 0 {
-                        let buffer = self.buffer.remaining_bytes();
-                        conn.in_buf.extend_from_slice(buffer);
+                    if let Some(io_buffer) = conn.io_buffer.take() {
+                        if !io_buffer.is_empty() {
+                            if let Some(in_buffer_mut) = conn.in_buffer.as_mut() {
+                                in_buffer_mut.extend_from_slice(&io_buffer);
+                            }
+                        }
                     }
-                    self.cache.clear();
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     status = IoStatus::Completed;

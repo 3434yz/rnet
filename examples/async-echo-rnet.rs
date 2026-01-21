@@ -4,7 +4,6 @@ use rnet::engine::{EngineBuilder, EngineHandler};
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 
-use bytes::BytesMut;
 use rnet::worker;
 
 use std::sync::Arc;
@@ -25,9 +24,9 @@ impl EventHandler for MyHandler {
         Action::None
     }
 
-    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action {
+    fn on_traffic(&self, conn: &mut Connection) -> Action {
         // let start_time = Instant::now();
-        if let Some(datas) = conn.next(None, cache) {
+        if let Some(datas) = conn.next(None) {
             let datas = datas.freeze();
             let gfd = conn.gfd();
             if let Some(engine) = &self.engine {

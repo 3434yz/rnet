@@ -148,12 +148,12 @@ where
         let mut threads = Vec::new();
 
         let handler = self.handler.as_ref().unwrap().clone();
+        let lock_os_thread = self.options.lock_os_thread;
 
         for (loop_id, core_id) in cores.into_iter().enumerate() {
             let (urgent_sender, urgent_receiver) = crossbeam::channel::unbounded();
             let (common_sender, common_receiver) = crossbeam::channel::unbounded();
             let conn_count = Arc::new(AtomicUsize::new(0));
-
             let mut event_loop = EventLoop::new(
                 loop_id as u8,
                 self.options.clone(),
@@ -168,8 +168,11 @@ where
             workers.push(event_loop.handle().clone());
 
             let t = thread::spawn(move || {
-                if !core_affinity::set_for_current(core_id) {
-                    eprintln!("EventLoop {} failed to pin to core", loop_id);
+                #[cfg(target_os = "linux")]
+                if lock_os_thread {
+                    if !core_affinity::set_for_current(core_id) {
+                        eprintln!("EventLoop {} failed to pin to core", loop_id);
+                    }
                 }
                 if let Err(e) = event_loop.run() {
                     eprintln!("EventLoop {} failed: {}", loop_id, e);
@@ -213,7 +216,7 @@ where
         let handler = self.handler.as_ref().expect("Handler is none").clone();
         struct PendingLoop<H: EventHandler> {
             el: EventLoop<H>,
-            core: core_affinity::CoreId,
+            core_id: core_affinity::CoreId,
             handle: Arc<EventLoopHandle>,
         }
 
@@ -229,7 +232,6 @@ where
                 .map(|addr| Listener::bind(addr.clone(), self.options.clone()))
                 .collect::<io::Result<Vec<_>>>()?;
             let conn_count = Arc::new(AtomicUsize::new(0));
-
             let event_loop = EventLoop::new(
                 loop_id as u8,
                 self.options.clone(),
@@ -246,7 +248,7 @@ where
             let handle = event_loop.handle().clone();
             pending.push(PendingLoop {
                 el: event_loop,
-                core: core_id,
+                core_id,
                 handle: handle,
             });
         }
@@ -261,11 +263,15 @@ where
 
         for p in pending {
             let mut el = p.el;
-            let core = p.core;
-            let idx = el.loop_id;
+            let core_id = p.core_id;
+            let loop_id = el.loop_id;
+            let lock_os_thread = self.options.lock_os_thread;
             let t = thread::spawn(move || {
-                if !core_affinity::set_for_current(core) {
-                    eprintln!("EventLoop {} failed to pin", idx);
+                #[cfg(target_os = "linux")]
+                if lock_os_thread {
+                    if !core_affinity::set_for_current(core_id) {
+                        eprintln!("EventLoop {} failed to pin to core", loop_id);
+                    }
                 }
                 if let Err(e) = el.run() {
                     eprintln!("EventLoop failed: {}", e);
@@ -307,7 +313,7 @@ mod tests {
             Action::None
         }
 
-        fn on_traffic(&self, _conn: &mut Connection, _cache: &mut BytesMut) -> Action {
+        fn on_traffic(&self, _conn: &mut Connection) -> Action {
             Action::None
         }
 

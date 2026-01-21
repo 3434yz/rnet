@@ -3,6 +3,7 @@ pub mod acceptor;
 pub mod balancer;
 pub mod command;
 pub mod connection;
+pub mod elastic;
 pub mod engine;
 pub mod event_loop;
 pub mod gfd;

@@ -1,7 +1,7 @@
 use crate::command::Command;
 use crate::event_loop::EventLoopHandle;
 use crate::gfd::Gfd;
-use crate::io_buffer::IOBuffer;
+use crate::io_buffer::{self, IOBuffer};
 use crate::options::Options;
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
@@ -9,8 +9,23 @@ use crate::socket_addr::NetworkAddress;
 use bytes::{Buf, Bytes, BytesMut};
 
 use std::io::{Read, Write};
-use std::ptr::NonNull;
+use std::ops::Deref;
 use std::sync::Arc;
+
+pub enum PeekData<'a> {
+    Raw(&'a [u8]),
+    BytesMut(BytesMut),
+}
+
+impl Deref for PeekData<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            PeekData::Raw(data) => *data,
+            PeekData::BytesMut(data) => &data[..],
+        }
+    }
+}
 
 pub struct Connection {
     pub(crate) gfd: Gfd,
@@ -18,10 +33,10 @@ pub struct Connection {
     pub(crate) local_addr: NetworkAddress,
     pub(crate) peer_addr: NetworkAddress,
     pub(crate) closed: bool,
-    pub(crate) in_buf: BytesMut,
+    pub(crate) io_buffer: Option<BytesMut>,
+    pub(crate) in_buffer: Option<BytesMut>,
     pub(crate) out_buf: BytesMut,
     pub(crate) handle: Arc<EventLoopHandle>,
-    buf_ptr: NonNull<IOBuffer>,
 }
 
 impl Connection {
@@ -32,7 +47,6 @@ impl Connection {
         local_addr: NetworkAddress,
         peer_addr: NetworkAddress,
         handle: Arc<EventLoopHandle>,
-        buf_ptr: NonNull<IOBuffer>,
     ) -> Self {
         Self {
             gfd,
@@ -40,10 +54,10 @@ impl Connection {
             local_addr,
             peer_addr,
             closed: false,
-            in_buf: BytesMut::with_capacity(options.read_buffer_cap),
+            in_buffer: None,
+            io_buffer: None,
             out_buf: BytesMut::with_capacity(options.write_buffer_cap),
             handle,
-            buf_ptr,
         }
     }
 
@@ -59,196 +73,136 @@ impl Connection {
         &self.peer_addr
     }
 
-    pub fn remaining(&self) -> usize {
-        unsafe {
-            let buffer = self.buf_ptr.as_ref();
-            self.in_buf.len() + buffer.remaining()
+    pub(crate) fn in_buf_len(&self) -> usize {
+        match self.in_buffer {
+            Some(ref buf) => buf.len(),
+            None => 0,
         }
     }
 
-    pub fn znext<'a>(&mut self, n: Option<usize>, cache: &'a mut BytesMut) -> Option<&'a [u8]> {
-        unsafe {
-            let el_buf = self.buf_ptr.as_mut();
-            let in_len = self.in_buf.len();
-            let el_len = el_buf.remaining();
-            let total_len = in_len + el_len;
-
-            if total_len == 0 {
-                return None;
-            }
-
-            let actual_len = match n {
-                Some(n) if n > total_len => return None,
-                Some(n) => n,
-                None => total_len,
-            };
-
-            if in_len == 0 {
-                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
-                let slice = std::slice::from_raw_parts(ptr, actual_len);
-                el_buf.advance(actual_len);
-                return Some(slice);
-            }
-
-            let take_from_in = std::cmp::min(in_len, actual_len);
-            cache.clear();
-            cache.extend_from_slice(&self.in_buf.split_to(take_from_in));
-
-            let take_from_el = actual_len - take_from_in;
-            if take_from_el > 0 {
-                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
-                let slice = std::slice::from_raw_parts(ptr, take_from_el);
-                cache.extend_from_slice(slice);
-                el_buf.advance(take_from_el);
-            }
-
-            Some(&cache[..])
+    pub(crate) fn io_buf_len(&self) -> usize {
+        match self.io_buffer {
+            Some(ref buf) => buf.remaining(),
+            None => 0,
         }
     }
 
-    pub fn next(&mut self, n: Option<usize>, cache: &mut BytesMut) -> Option<BytesMut> {
-        unsafe {
-            let el_buf = self.buf_ptr.as_mut();
-            let in_len = self.in_buf.len();
-            let el_len = el_buf.remaining();
-            let total_len = in_len + el_len;
+    pub fn next(&mut self, n: Option<usize>) -> Option<BytesMut> {
+        let in_buffer_len = self.in_buf_len();
+        let io_buffer_len = self.io_buf_len();
+        let total_len = in_buffer_len + io_buffer_len;
 
-            if total_len == 0 {
-                return None;
+        let actual_len = match n {
+            Some(n) if n > total_len => return None,
+            Some(n) => n,
+            None => total_len,
+        };
+
+        if in_buffer_len == 0 {
+            if let Some(io_buffer_mut) = self.io_buffer.as_mut() {
+                let data = io_buffer_mut.split_to(actual_len);
+                return Some(data);
             }
-
-            let actual_len = match n {
-                Some(n) if n > total_len => return None,
-                Some(n) => n,
-                None => total_len,
-            };
-
-            if in_len >= actual_len {
-                return Some(self.in_buf.split_to(actual_len));
-            }
-
-            cache.clear();
-            if in_len > 0 {
-                cache.extend_from_slice(&self.in_buf);
-                self.in_buf.clear();
-            }
-
-            let remaining = actual_len - in_len;
-            if remaining > 0 {
-                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
-                let slice = std::slice::from_raw_parts(ptr, remaining);
-                cache.extend_from_slice(slice);
-                el_buf.advance(remaining);
-            }
-
-            Some(cache.split_to(actual_len))
+            return None;
         }
+
+        let remaining = actual_len;
+        let Some(in_buf_mut) = self.in_buffer.as_mut() else {
+            return None;
+        };
+
+        if remaining <= in_buffer_len {
+            let data = in_buf_mut.split_to(actual_len);
+            return Some(data);
+        }
+
+        /*
+            到这里代表获取in_buffer+io_buffer的数据
+            ByestMut 在余量不足时可能原地扩容，所以
+            这里选择直接把io_buffer中的数据拷贝到
+            in_buffer中，发生拷贝的数据量在理想情况下
+            只有 actual_len - in_buffer_len 。同时
+            io_buffer在下一轮eventloop可以复用。
+        */
+
+        let io_buffer_mut = self.io_buffer.as_mut().unwrap();
+        let copy_by_io = remaining - in_buffer_len;
+        let mut in_buffer = self.in_buffer.take().unwrap();
+        in_buffer.extend_from_slice(&io_buffer_mut[..copy_by_io]);
+        io_buffer_mut.advance(copy_by_io);
+        return Some(in_buffer);
     }
 
-    pub fn zpeek<'a>(&'a self, n: Option<usize>, cache: &'a mut BytesMut) -> Option<&'a [u8]> {
-        unsafe {
-            let el_buf = self.buf_ptr.as_ref();
-            let in_len = self.in_buf.len();
-            let el_len = el_buf.remaining();
-            let total_len = in_len + el_len;
+    pub fn peek(&self, n: Option<usize>) -> Option<PeekData<'_>> {
+        let in_buffer_len = self.in_buf_len();
+        let io_buffer_len = self.io_buf_len();
+        let total_len = in_buffer_len + io_buffer_len;
 
-            if total_len == 0 {
-                return None;
+        let actual_len = match n {
+            Some(n) if n > total_len => return None,
+            Some(n) => n,
+            None => total_len,
+        };
+
+        if in_buffer_len == 0 {
+            if let Some(io_buffer_mut) = self.io_buffer.as_ref() {
+                return Some(PeekData::Raw(&io_buffer_mut[..actual_len]));
             }
-
-            let actual_len = match n {
-                Some(n) if n > total_len => return None,
-                Some(n) => n,
-                None => total_len,
-            };
-
-            if in_len == 0 {
-                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
-                let slice = std::slice::from_raw_parts(ptr, actual_len);
-                return Some(slice);
-            }
-
-            if in_len >= actual_len {
-                return Some(&self.in_buf[..actual_len]);
-            }
-
-            cache.clear();
-            cache.extend_from_slice(&self.in_buf);
-            let remaining = actual_len - in_len;
-            if remaining > 0 {
-                let slice = &el_buf.remaining_bytes()[..remaining];
-                cache.extend_from_slice(slice);
-            }
-            return Some(&cache[..]);
+            return None;
         }
-    }
 
-    pub fn peek<'a>(&self, n: Option<usize>, cache: &'a mut BytesMut) -> Option<&'a [u8]> {
-        unsafe {
-            let el_buf = self.buf_ptr.as_ref();
-            let in_len = self.in_buf.len();
-            let el_len = el_buf.remaining();
-            let total_len = in_len + el_len;
+        let remaining = actual_len;
+        let Some(in_buf_mut) = self.in_buffer.as_ref() else {
+            return None;
+        };
 
-            if total_len == 0 {
-                return None;
-            }
-
-            let actual_len = match n {
-                Some(n) if n > total_len => return None,
-                Some(n) => n,
-                None => total_len,
-            };
-
-            if in_len == 0 {
-                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
-                let slice = std::slice::from_raw_parts(ptr, actual_len);
-                return Some(slice);
-            }
-
-            cache.clear();
-            if in_len >= actual_len {
-                cache.extend_from_slice(&self.in_buf[..actual_len]);
-                return Some(&cache[..]);
-            }
-
-            cache.extend_from_slice(&self.in_buf);
-            let remaining = actual_len - in_len;
-            if remaining > 0 {
-                let slice = &el_buf.remaining_bytes()[..remaining];
-                cache.extend_from_slice(slice);
-            }
-            return Some(&cache[..]);
+        if remaining <= in_buffer_len {
+            return Some(PeekData::Raw(&in_buf_mut[..actual_len]));
         }
+
+        let copy_by_io = remaining - in_buffer_len;
+        let io_buffer_mut = self.io_buffer.as_ref().unwrap();
+        let mut data = BytesMut::with_capacity(actual_len);
+        data.extend_from_slice(in_buf_mut);
+        data.extend_from_slice(&io_buffer_mut[..copy_by_io]);
+        return Some(PeekData::BytesMut(data));
     }
 
     pub fn discard(&mut self, n: Option<usize>) -> Option<usize> {
-        unsafe {
-            let el_buf = self.buf_ptr.as_mut();
-            let in_len = self.in_buf.len();
-            let el_len = el_buf.remaining();
-            let total_len = in_len + el_len;
+        let in_buffer_len = self.in_buf_len();
+        let io_buffer_len = self.io_buf_len();
+        let total_len = in_buffer_len + io_buffer_len;
 
-            if total_len == 0 {
-                return None;
+        let actual_len = match n {
+            Some(n) if n > total_len => return None,
+            Some(n) => n,
+            None => total_len,
+        };
+
+        if in_buffer_len == 0 {
+            if let Some(io_buffer_mut) = self.io_buffer.as_mut() {
+                io_buffer_mut.advance(actual_len);
+                return Some(actual_len);
             }
-
-            let actual_len = match n {
-                Some(n) if n > total_len => return None,
-                Some(n) => n,
-                None => total_len,
-            };
-
-            if in_len >= actual_len {
-                self.in_buf.advance(actual_len);
-            } else {
-                self.in_buf.advance(in_len);
-                let remaining = actual_len - in_len;
-                el_buf.advance(remaining);
-            }
-
-            Some(actual_len)
+            return None;
         }
+
+        let remaining = actual_len;
+        let in_buf_mut = self.in_buffer.as_mut().unwrap();
+
+        if remaining <= in_buffer_len {
+            in_buf_mut.advance(remaining);
+            if in_buf_mut.is_empty() {
+                self.in_buffer = None;
+            }
+            return Some(actual_len);
+        }
+
+        self.in_buffer = None;
+        let discard_from_io = remaining - in_buffer_len;
+        let io_buffer_mut = self.io_buffer.as_mut().unwrap();
+        io_buffer_mut.advance(discard_from_io);
+        Some(actual_len)
     }
 
     pub fn close(&mut self) {
@@ -268,35 +222,35 @@ impl Connection {
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut written = 0;
+        let mut total_read = 0;
 
-        if !self.in_buf.is_empty() {
-            let len = std::cmp::min(buf.len(), self.in_buf.len());
-            buf[..len].copy_from_slice(&self.in_buf[..len]);
-            self.in_buf.advance(len);
-            written += len;
-        }
-
-        if written == buf.len() {
-            return Ok(written);
-        }
-
-        unsafe {
-            let el_buf = self.buf_ptr.as_mut();
-            let remaining = el_buf.remaining();
-            if remaining > 0 {
-                let to_read = std::cmp::min(buf.len() - written, remaining);
-
-                let ptr = el_buf.buffer.as_ptr().add(el_buf.cursor);
-                let slice = std::slice::from_raw_parts(ptr, to_read);
-
-                buf[written..written + to_read].copy_from_slice(slice);
-                el_buf.advance(to_read);
-                written += to_read;
+        if let Some(in_buf) = self.in_buffer.as_mut() {
+            let len = std::cmp::min(buf.len(), in_buf.len());
+            if len > 0 {
+                buf[..len].copy_from_slice(&in_buf[..len]);
+                in_buf.advance(len);
+                total_read += len;
+            }
+            if in_buf.is_empty() {
+                self.in_buffer = None;
             }
         }
 
-        Ok(written)
+        if total_read == buf.len() {
+            return Ok(total_read);
+        }
+
+        if let Some(io_buf) = self.io_buffer.as_mut() {
+            let remaining = buf.len() - total_read;
+            let len = std::cmp::min(remaining, io_buf.len());
+            if len > 0 {
+                buf[total_read..total_read + len].copy_from_slice(&io_buf[..len]);
+                io_buf.advance(len);
+                total_read += len;
+            }
+        }
+
+        Ok(total_read)
     }
 }
 

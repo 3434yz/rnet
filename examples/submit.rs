@@ -10,6 +10,10 @@ use bytes::{Bytes, BytesMut};
 use std::io::Write;
 use std::sync::Arc;
 
+fn ser(data: &[u8]) -> &[u8] {
+    return &[];
+}
+
 #[derive(Clone)]
 struct MyHandler {
     engine: Option<Arc<EngineHandler>>,
@@ -27,10 +31,11 @@ impl EventHandler for MyHandler {
         Action::None
     }
 
-    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action {
-        if let Some(datas) = conn.znext(None, cache) {
-            let _ = conn.write(datas);
+    fn on_traffic(&self, conn: &mut Connection) -> Action {
+        if let Some(datas) = conn.next(None) {
+            let _ = conn.write(&datas);
         }
+
         if let Some(engine) = &self.engine {
             let gfd = conn.gfd();
             let engine = engine.clone();

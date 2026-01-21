@@ -3,8 +3,6 @@ use rnet::engine::{EngineBuilder, EngineHandler};
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 
-use bytes::BytesMut;
-
 use std::io::Write;
 use std::sync::Arc;
 
@@ -24,9 +22,9 @@ impl EventHandler for MyHandler {
         Action::None
     }
 
-    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action {
-        if let Some(datas) = conn.znext(None, cache) {
-            let _ = conn.write(datas);
+    fn on_traffic(&self, conn: &mut Connection) -> Action {
+        if let Some(data) = conn.next(None) {
+            let _ = conn.write(&data);
         }
         Action::None
     }
@@ -40,8 +38,8 @@ impl EventHandler for MyHandler {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let mut port: u16 = 0;
-    let mut num_event_loop: usize = 0;
+    let mut port: u16 = 9000;
+    let mut num_event_loop: usize = 8;
 
     let mut i = 1;
     while i < args.len() {
@@ -58,16 +56,20 @@ fn main() {
                     i += 1;
                 }
             }
+            "--help" | "-h" => {
+                println!("Usage: echo [--port <port>] [--loops <num_event_loop>]");
+                println!("Defaults: port=9000, loops=8");
+                return;
+            }
             _ => {}
         }
         i += 1;
     }
 
-    // 校验必填参数
-    if port == 0 || num_event_loop == 0 {
-        eprintln!("Usage: echo --port <port> --loops <num_event_loop>");
-        std::process::exit(1);
-    }
+    println!(
+        "Starting server on port: {}, loops: {}",
+        port, num_event_loop
+    );
 
     let mut options = Options::builder()
         .reuse_addr(true)

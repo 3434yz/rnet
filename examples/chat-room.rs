@@ -1,4 +1,3 @@
-use bytes::BytesMut;
 use rnet::command::Command;
 use rnet::connection::Connection;
 use rnet::engine::{EngineBuilder, EngineHandler};
@@ -31,11 +30,11 @@ impl EventHandler for ChatRoomHandler {
         Action::None
     }
 
-    fn on_traffic(&self, conn: &mut Connection, cache: &mut BytesMut) -> Action {
+    fn on_traffic(&self, conn: &mut Connection) -> Action {
         loop {
             let mut found_len = None;
             // Peek data to find a newline
-            if let Some(data) = conn.peek(None, cache) {
+            if let Some(data) = conn.peek(None) {
                 if let Some(pos) = data.iter().position(|&b| b == b'\n') {
                     found_len = Some(pos + 1);
                 }
@@ -44,7 +43,7 @@ impl EventHandler for ChatRoomHandler {
             let Some(len) = found_len else {
                 break;
             };
-            if let Some(data) = conn.next(Some(len), cache) {
+            if let Some(data) = conn.next(Some(len)) {
                 let msg = data.freeze();
                 let sender_gfd = conn.gfd();
 
