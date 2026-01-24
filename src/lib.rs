@@ -1,14 +1,12 @@
-// pub mod codec;
 pub mod acceptor;
 pub mod balancer;
+pub mod codec;
 pub mod command;
 pub mod connection;
-pub mod elastic;
 pub mod engine;
 pub mod event_loop;
 pub mod gfd;
 pub mod handler;
-pub mod io_buffer;
 pub mod listener;
 pub mod options;
 pub mod poller;

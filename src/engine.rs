@@ -290,6 +290,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::codec::RawCodec;
     use crate::connection::Connection;
     use crate::engine::{EngineBuilder, EngineHandler};
     use crate::handler::{Action, EventHandler};

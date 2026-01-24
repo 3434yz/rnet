@@ -126,4 +126,12 @@ impl Write for Socket {
             Self::Unix(s) => s.flush(),
         }
     }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(s) => s.write_vectored(bufs),
+            #[cfg(unix)]
+            Self::Unix(s) => s.write_vectored(bufs),
+        }
+    }
 }

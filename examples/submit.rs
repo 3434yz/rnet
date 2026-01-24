@@ -5,14 +5,10 @@ use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 use rnet::worker;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 use std::io::Write;
 use std::sync::Arc;
-
-fn ser(data: &[u8]) -> &[u8] {
-    return &[];
-}
 
 #[derive(Clone)]
 struct MyHandler {

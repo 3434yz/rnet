@@ -1,13 +1,14 @@
 use crate::command::Command;
 use crate::event_loop::EventLoopHandle;
 use crate::gfd::Gfd;
-use crate::io_buffer::{self, IOBuffer};
 use crate::options::Options;
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
 use bytes::{Buf, Bytes, BytesMut};
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -27,6 +28,12 @@ impl Deref for PeekData<'_> {
     }
 }
 
+const IO_MAX: usize = 1024;
+
+thread_local! {
+    static IO_SLICES: RefCell<Vec<std::io::IoSlice<'static>>> = RefCell::new(Vec::with_capacity(IO_MAX));
+}
+
 pub struct Connection {
     pub(crate) gfd: Gfd,
     pub(crate) socket: Socket,
@@ -35,8 +42,10 @@ pub struct Connection {
     pub(crate) closed: bool,
     pub(crate) io_buffer: Option<BytesMut>,
     pub(crate) in_buffer: Option<BytesMut>,
-    pub(crate) out_buf: BytesMut,
+    pub(crate) out_buffer: Option<VecDeque<Bytes>>,
     pub(crate) handle: Arc<EventLoopHandle>,
+    pub(crate) options: Arc<Options>,
+    pub codec: Option<Box<dyn crate::codec::Codec>>,
 }
 
 impl Connection {
@@ -56,8 +65,10 @@ impl Connection {
             closed: false,
             in_buffer: None,
             io_buffer: None,
-            out_buf: BytesMut::with_capacity(options.write_buffer_cap),
+            out_buffer: None,
             handle,
+            options,
+            codec: None,
         }
     }
 
@@ -205,18 +216,129 @@ impl Connection {
         Some(actual_len)
     }
 
+    pub fn set_codec<C: crate::codec::Codec + 'static>(&mut self, codec: C) {
+        self.codec = Some(Box::new(codec));
+    }
+
+    pub fn next_message(&mut self) -> std::io::Result<Option<Box<dyn std::any::Any + Send>>> {
+        if let Some(codec) = self.codec.as_mut() {
+            if let Some(in_buffer) = self.in_buffer.as_mut() {
+                return codec.decode(in_buffer);
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn send<T: 'static + Send>(&mut self, msg: T) -> std::io::Result<()> {
+        if let Some(codec) = self.codec.as_mut() {
+            let mut buf = BytesMut::new();
+            codec.encode(Box::new(msg), &mut buf)?;
+            let bytes = buf.freeze();
+            self.write_bytes(bytes)?;
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No codec set",
+            ))
+        }
+    }
+
+    pub fn write_bytes(&mut self, buf: Bytes) -> std::io::Result<usize> {
+        let len = buf.len();
+        if let Some(out_buffer) = &mut self.out_buffer {
+            if !out_buffer.is_empty() {
+                out_buffer.push_back(buf);
+                return Ok(len);
+            }
+        }
+
+        match self.socket.write(&buf) {
+            Ok(n) => {
+                if n < len {
+                    let remaining = buf.slice(n..);
+                    self.out_buffer
+                        .get_or_insert_with(VecDeque::new)
+                        .push_back(remaining);
+                }
+                Ok(len)
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                self.out_buffer
+                    .get_or_insert_with(VecDeque::new)
+                    .push_back(buf);
+                Ok(len)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn write_vectored_bytes(&mut self, bufs: &[Bytes]) -> std::io::Result<usize> {
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        if total_len == 0 {
+            return Ok(0);
+        }
+
+        if let Some(out_buffer) = &mut self.out_buffer {
+            if !out_buffer.is_empty() {
+                out_buffer.extend(bufs.iter().cloned());
+                return Ok(total_len);
+            }
+        }
+
+        let res = IO_SLICES.with(|cells| {
+            let mut io_slices = cells.borrow_mut();
+            io_slices.clear();
+            for buf in bufs {
+                let slice = std::io::IoSlice::new(buf);
+                let static_slice = unsafe {
+                    std::mem::transmute::<std::io::IoSlice<'_>, std::io::IoSlice<'static>>(slice)
+                };
+                io_slices.push(static_slice);
+            }
+            self.socket.write_vectored(&io_slices)
+        });
+
+        match res {
+            Ok(n) => {
+                if n < total_len {
+                    let mut written = n;
+                    let out_buffer = self.out_buffer.get_or_insert_with(VecDeque::new);
+                    for buf in bufs {
+                        let len = buf.len();
+                        if written >= len {
+                            written -= len;
+                        } else {
+                            if written > 0 {
+                                out_buffer.push_back(buf.slice(written..));
+                                written = 0;
+                            } else {
+                                out_buffer.push_back(buf.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(total_len)
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                self.out_buffer
+                    .get_or_insert_with(VecDeque::new)
+                    .extend(bufs.iter().cloned());
+                Ok(total_len)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn close(&mut self) {
         let cmd = Command::Close(self.gfd.slab_index());
         let _ = self.handle.trigger(cmd.priority(), cmd);
-    }
-
-    pub fn aysnc_write(&mut self, buf: Bytes) {
-        let cmd = Command::AsyncWrite(self.gfd, buf);
-        let _ = self.handle.trigger(cmd.priority(), cmd);
-    }
-
-    pub fn buffer_write(&mut self, buf: &[u8]) {
-        self.out_buf.extend_from_slice(buf);
     }
 }
 
@@ -256,50 +378,143 @@ impl Read for Connection {
 
 impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.out_buf.is_empty() {
-            self.out_buf.extend_from_slice(buf);
-            return Ok(buf.len());
+        if let Some(out_buffer) = &mut self.out_buffer {
+            if !out_buffer.is_empty() {
+                out_buffer.push_back(Bytes::copy_from_slice(buf));
+                return Ok(buf.len());
+            }
         }
 
         match self.socket.write(buf) {
             Ok(n) => {
                 if n < buf.len() {
-                    self.out_buf.extend_from_slice(&buf[n..]);
+                    let remaining = Bytes::copy_from_slice(&buf[n..]);
+                    self.out_buffer
+                        .get_or_insert_with(VecDeque::new)
+                        .push_back(remaining);
                 }
                 Ok(buf.len())
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                self.out_buf.extend_from_slice(buf);
+                let bytes = Bytes::copy_from_slice(buf);
+                self.out_buffer
+                    .get_or_insert_with(VecDeque::new)
+                    .push_back(bytes);
                 Ok(buf.len())
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                self.out_buf.extend_from_slice(buf);
+                let bytes = Bytes::copy_from_slice(buf);
+                self.out_buffer
+                    .get_or_insert_with(VecDeque::new)
+                    .push_back(bytes);
                 Ok(buf.len())
             }
             Err(e) => Err(e),
         }
     }
 
-    // todo 饥饿读写
     fn flush(&mut self) -> std::io::Result<()> {
-        while !self.out_buf.is_empty() {
-            match self.socket.write(&self.out_buf) {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "connection closed",
-                    ));
+        if let Some(out_buffer) = &mut self.out_buffer {
+            let socket = &mut self.socket;
+            IO_SLICES.with(|cells| {
+                let mut io_slices = cells.borrow_mut();
+                while !out_buffer.is_empty() {
+                    io_slices.clear();
+                    for buf in out_buffer.iter().take(IO_MAX) {
+                        let slice = std::io::IoSlice::new(buf);
+                        let static_slice = unsafe {
+                            std::mem::transmute::<std::io::IoSlice<'_>, std::io::IoSlice<'static>>(
+                                slice,
+                            )
+                        };
+                        io_slices.push(static_slice);
+                    }
+
+                    let res = socket.write_vectored(&io_slices);
+                    io_slices.clear();
+
+                    match res {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "connection closed",
+                            ));
+                        }
+                        Ok(n) => {
+                            let mut written = n;
+                            while written > 0 {
+                                if let Some(front) = out_buffer.front_mut() {
+                                    if front.len() <= written {
+                                        written -= front.len();
+                                        out_buffer.pop_front();
+                                    } else {
+                                        front.advance(written);
+                                        written = 0;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "flush would block",
+                            ));
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                Ok(n) => self.out_buf.advance(n),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
+                Ok(())
+            })?;
         }
         self.socket.flush()
     }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        if total_len == 0 {
+            return Ok(0);
+        }
+
+        if let Some(out_buffer) = &mut self.out_buffer {
+            if !out_buffer.is_empty() {
+                for buf in bufs {
+                    out_buffer.push_back(Bytes::copy_from_slice(buf));
+                }
+                return Ok(total_len);
+            }
+        }
+
+        match self.socket.write_vectored(bufs) {
+            Ok(n) => {
+                if n < total_len {
+                    let mut written = n;
+                    let out_buffer = self.out_buffer.get_or_insert_with(VecDeque::new);
+                    for buf in bufs {
+                        let len = buf.len();
+                        if written >= len {
+                            written -= len;
+                        } else {
+                            out_buffer.push_back(Bytes::copy_from_slice(&buf[written..]));
+                            written = 0;
+                        }
+                    }
+                }
+                Ok(total_len)
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                let out_buffer = self.out_buffer.get_or_insert_with(VecDeque::new);
+                for buf in bufs {
+                    out_buffer.push_back(Bytes::copy_from_slice(buf));
+                }
+                Ok(total_len)
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
-
-unsafe impl Send for Connection {}
-
-unsafe impl Sync for Connection {}

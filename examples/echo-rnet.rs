@@ -6,18 +6,13 @@ use rnet::options::Options;
 use std::io::Write;
 use std::sync::Arc;
 
-use mimalloc::MiMalloc;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
 #[derive(Clone)]
 struct MyHandler {
     engine: Option<Arc<EngineHandler>>,
 }
 
 impl EventHandler for MyHandler {
-    fn on_open(&self, conn: &mut Connection) -> Action {
+    fn on_open(&self, _conn: &mut Connection) -> Action {
         // println!("New Connect in {}", conn.gfd.event_loop_index());
         Action::None
     }
@@ -29,7 +24,7 @@ impl EventHandler for MyHandler {
         Action::None
     }
 
-    fn on_close(&self, _ctx: &mut Connection) -> Action {
+    fn on_close(&self, _conn: &mut Connection) -> Action {
         // println!("Close Connect");
         Action::None
     }

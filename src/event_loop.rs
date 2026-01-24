@@ -2,10 +2,9 @@ use crate::command::{Command, Prioity};
 use crate::connection::Connection;
 use crate::gfd::Gfd;
 use crate::handler::{Action, EventHandler};
-use crate::io_buffer::IOBuffer;
 use crate::listener::Listener;
 use crate::options::Options;
-use crate::poller::{Poller, WAKE_TOKEN, Waker};
+use crate::poller::{Poller, Waker};
 use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
@@ -15,6 +14,7 @@ use mio::event::Event;
 use mio::{Events, Token};
 use slab::Slab;
 
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,10 +24,17 @@ const EVENTS_CAP: usize = 1024;
 const MAX_POLL_EVENT_CAP: usize = 1024;
 const MAX_ASYNC_TASK_ONE_TIME: usize = 256;
 
+const IO_MAX: usize = 1024;
+
+thread_local! {
+    static IO_SLICES: RefCell<Vec<io::IoSlice<'static>>> = RefCell::new(Vec::with_capacity(IO_MAX));
+}
+
 enum IoStatus {
     Completed,
     Yield,
     Closed(bool),
+    Shutdown,
 }
 
 #[derive(Clone, Debug)]
@@ -162,7 +169,8 @@ where
 
     fn reregister(&mut self, key: usize) -> io::Result<()> {
         if let Some(conn) = self.connections.get_mut(key) {
-            if conn.out_buf.is_empty() {
+            let is_empty = conn.out_buffer.as_ref().map_or(true, |b| b.is_empty());
+            if is_empty {
                 self.poll.disable_write(&mut conn.socket, Token(key))?;
             } else {
                 self.poll.enable_write(&mut conn.socket, Token(key))?;
@@ -205,7 +213,7 @@ where
 
             for event in events.iter() {
                 let token = event.token();
-                if token == WAKE_TOKEN {
+                if token == crate::poller::WAKE_TOKEN {
                     self.handle.waker.reset();
                     self.process_command()?;
                 } else if let Some(idx) = crate::poller::is_listener_token(token) {
@@ -382,7 +390,7 @@ where
         if graceful {
             let _ = conn.flush();
         } else {
-            conn.out_buf.clear();
+            conn.out_buffer = None;
         }
 
         self.handler.on_close(conn);
@@ -394,74 +402,7 @@ where
     }
 
     fn read_socket(&mut self, key: usize) -> io::Result<()> {
-        let status;
-        let conn = match self.connections.get_mut(key) {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        if conn.closed {
-            return Ok(());
-        }
-
-        let mut bytes_read = 0;
-        let max_batch_size = self.options.max_batch_size;
-
-        loop {
-            if bytes_read >= max_batch_size {
-                status = IoStatus::Yield;
-                break;
-            }
-            let read_buffer_cap = self.options.read_buffer_cap;
-            if self.io_buffer.capacity() < read_buffer_cap {
-                self.io_buffer.reserve(read_buffer_cap);
-            }
-            if self.io_buffer.len() < read_buffer_cap {
-                unsafe { self.io_buffer.set_len(read_buffer_cap) };
-            }
-
-            match conn.socket.read(&mut self.io_buffer) {
-                Ok(0) => {
-                    status = IoStatus::Closed(true);
-                    break;
-                }
-                Ok(n) => {
-                    bytes_read += n;
-                    let io_buffer = self.io_buffer.split_to(n);
-                    conn.io_buffer = Some(io_buffer);
-                    match self.handler.on_traffic(conn) {
-                        Action::None => {}
-                        Action::Close => {
-                            status = IoStatus::Closed(true);
-                            break;
-                        }
-                        Action::Shutdown => {
-                            self.shutdown();
-                            return Err(io::Error::new(
-                                io::ErrorKind::Interrupted,
-                                "EventLoop Shutdown",
-                            ));
-                        }
-                    }
-
-                    if let Some(io_buffer) = conn.io_buffer.take() {
-                        if !io_buffer.is_empty() {
-                            if let Some(in_buffer_mut) = conn.in_buffer.as_mut() {
-                                in_buffer_mut.extend_from_slice(&io_buffer);
-                            }
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    status = IoStatus::Completed;
-                    break;
-                }
-                Err(_) => {
-                    status = IoStatus::Closed(false);
-                    break;
-                }
-            }
-        }
+        let status = self.process_read(key)?;
 
         match status {
             IoStatus::Closed(graceful) => {
@@ -471,62 +412,154 @@ where
                 let _ = self.trigger(Prioity::High, Command::IORead(key));
             }
             IoStatus::Completed => {}
+            IoStatus::Shutdown => {
+                self.shutdown();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "EventLoop Shutdown",
+                ));
+            }
         }
         Ok(())
     }
 
-    fn write_socket(&mut self, key: usize) -> io::Result<()> {
+    fn process_read(&mut self, key: usize) -> io::Result<IoStatus> {
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return Ok(()),
+            None => return Ok(IoStatus::Completed),
         };
 
-        let mut bytes_written = 0;
-        let max_batch_size = self.options.max_batch_size;
-
-        let mut status = IoStatus::Completed;
-        while !conn.out_buf.is_empty() {
-            if bytes_written >= max_batch_size {
-                status = IoStatus::Yield;
-                break;
-            }
-
-            let total_len = conn.out_buf.len();
-            let remaining = max_batch_size - bytes_written;
-            let actual_len = std::cmp::min(remaining, total_len);
-            let data = &conn.out_buf[0..actual_len];
-
-            match conn.socket.write(data) {
-                Ok(0) => {
-                    status = IoStatus::Closed(false);
-                    break;
-                }
-                Ok(n) => {
-                    conn.out_buf.advance(n);
-                    bytes_written += n;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    status = IoStatus::Completed;
-                    break;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    status = IoStatus::Closed(false);
-                    break;
-                }
-            }
+        if conn.closed {
+            return Ok(IoStatus::Completed);
         }
 
-        match status {
+        let mut bytes_read = 0;
+        let max_batch_size = self.options.max_batch_size;
+        let read_buffer_cap = self.options.read_buffer_cap;
+
+        loop {
+            if bytes_read >= max_batch_size {
+                return Ok(IoStatus::Yield);
+            }
+
+            if self.io_buffer.capacity() < read_buffer_cap {
+                self.io_buffer.reserve(read_buffer_cap);
+            }
+            if self.io_buffer.len() < read_buffer_cap {
+                unsafe { self.io_buffer.set_len(read_buffer_cap) };
+            }
+
+            match conn.socket.read(&mut self.io_buffer) {
+                Ok(0) => return Ok(IoStatus::Closed(true)),
+                Ok(n) => {
+                    bytes_read += n;
+                    let io_buffer = self.io_buffer.split_to(n);
+                    conn.io_buffer = Some(io_buffer);
+                    match self.handler.on_traffic(conn) {
+                        Action::None => {}
+                        Action::Close => return Ok(IoStatus::Closed(true)),
+                        Action::Shutdown => return Ok(IoStatus::Shutdown),
+                    }
+
+                    if let Some(io_buffer) = conn.io_buffer.take() {
+                        if !io_buffer.is_empty() {
+                            if let Some(in_buffer) = conn.in_buffer.as_mut() {
+                                in_buffer.extend_from_slice(&io_buffer);
+                            } else {
+                                conn.in_buffer = Some(io_buffer);
+                            }
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(IoStatus::Completed);
+                }
+                Err(_) => return Ok(IoStatus::Closed(false)),
+            }
+        }
+    }
+
+    fn write_socket(&mut self, key: usize) -> io::Result<()> {
+        match self.process_write(key)? {
             IoStatus::Closed(graceful) => {
                 self.close_connection(key, graceful)?;
             }
             IoStatus::Yield => {
                 let _ = self.trigger(Prioity::High, Command::IOWrite(key));
             }
-            IoStatus::Completed => {}
+            IoStatus::Completed => {
+                self.reregister(key)?;
+            }
+            IoStatus::Shutdown => {
+                let _ = self.trigger(Prioity::High, Command::Shutdown);
+            }
         }
         Ok(())
+    }
+
+    fn process_write(&mut self, key: usize) -> io::Result<IoStatus> {
+        let max_batch_size = self.options.max_batch_size;
+        let conn = match self.connections.get_mut(key) {
+            Some(c) => c,
+            None => return Ok(IoStatus::Completed),
+        };
+
+        let out_buffer = match &mut conn.out_buffer {
+            Some(buf) if !buf.is_empty() => buf,
+            _ => return Ok(IoStatus::Completed),
+        };
+
+        let socket = &mut conn.socket;
+        let mut bytes_written = 0;
+        IO_SLICES.with(|cells| {
+            let mut io_slices = cells.borrow_mut();
+            while !out_buffer.is_empty() {
+                if bytes_written >= max_batch_size {
+                    return Ok(IoStatus::Yield);
+                }
+
+                io_slices.clear();
+                for buf in out_buffer.iter().take(IO_MAX) {
+                    let slice = io::IoSlice::new(buf);
+                    // SAFETY: 我们在 write_vectored 调用后立即清空 io_slices，
+                    // 确保了 slice 的生命周期不会超出 buf 的有效范围。
+                    let static_slice = unsafe {
+                        std::mem::transmute::<io::IoSlice<'_>, io::IoSlice<'static>>(slice)
+                    };
+                    io_slices.push(static_slice);
+                }
+
+                let res = socket.write_vectored(&io_slices);
+                io_slices.clear();
+
+                match res {
+                    Ok(0) => return Ok(IoStatus::Closed(false)),
+                    Ok(n) => {
+                        bytes_written += n;
+                        let mut written = n;
+                        while written > 0 {
+                            if let Some(front) = out_buffer.front_mut() {
+                                if front.len() <= written {
+                                    written -= front.len();
+                                    out_buffer.pop_front();
+                                } else {
+                                    front.advance(written);
+                                    written = 0;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        return Ok(IoStatus::Completed);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return Ok(IoStatus::Closed(false)),
+                }
+            }
+            Ok(IoStatus::Completed)
+        })
     }
 
     fn trigger(&self, priority: Prioity, command: Command) -> io::Result<bool> {
