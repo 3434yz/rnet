@@ -332,6 +332,7 @@ where
         if event.is_error() || event.is_readable() {
             self.read_socket(key)?;
         }
+        self.reregister(key)?;
 
         Ok(())
     }

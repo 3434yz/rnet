@@ -6,6 +6,7 @@ use crate::socket::Socket;
 use crate::socket_addr::NetworkAddress;
 
 use bytes::{Buf, Bytes, BytesMut};
+use smallvec::SmallVec;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -98,7 +99,7 @@ impl Connection {
         }
     }
 
-    pub fn next(&mut self, n: Option<usize>) -> Option<BytesMut> {
+    pub fn next_contiguous(&mut self, n: Option<usize>) -> Option<BytesMut> {
         let in_buffer_len = self.in_buf_len();
         let io_buffer_len = self.io_buf_len();
         let total_len = in_buffer_len + io_buffer_len;
@@ -142,6 +143,42 @@ impl Connection {
         in_buffer.extend_from_slice(&io_buffer_mut[..copy_by_io]);
         io_buffer_mut.advance(copy_by_io);
         return Some(in_buffer);
+    }
+
+    pub fn next_vectored(&mut self, n: Option<usize>) -> Option<SmallVec<[BytesMut; 2]>> {
+        let in_buffer_len = self.in_buf_len();
+        let io_buffer_len = self.io_buf_len();
+        let total_len = in_buffer_len + io_buffer_len;
+
+        let actual_len = match n {
+            Some(n) if n > total_len || n <= 0 => return None,
+            Some(n) => n,
+            None => total_len,
+        };
+
+        let mut remaining = actual_len;
+        let mut result = SmallVec::new();
+
+        if let Some(in_buf_mut) = self.in_buffer.as_mut() {
+            let len = std::cmp::min(remaining, in_buf_mut.len());
+            if len > 0 {
+                let data = in_buf_mut.split_to(len);
+                result.push(data);
+                remaining -= len;
+            }
+            if in_buf_mut.is_empty() {
+                self.in_buffer = None;
+            }
+        }
+
+        if remaining > 0 {
+            if let Some(io_buf_mut) = self.io_buffer.as_mut() {
+                let data = io_buf_mut.split_to(remaining);
+                result.push(data);
+            }
+        }
+
+        Some(result)
     }
 
     pub fn peek(&self, n: Option<usize>) -> Option<PeekData<'_>> {

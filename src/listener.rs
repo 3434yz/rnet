@@ -245,7 +245,7 @@ fn configure_socket(socket: &socket2::Socket, options: &Options) -> io::Result<(
         socket.set_send_buffer_size(options.socket_send_buffer)?;
     }
 
-    #[cfg(unix)]
+    #[cfg(linux)]
     if !options.bind_to_device.is_empty() {
         let device = options.bind_to_device.as_bytes();
         socket.bind_device(Some(device))?;

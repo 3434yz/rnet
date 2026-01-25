@@ -43,7 +43,7 @@ impl EventHandler for ChatRoomHandler {
             let Some(len) = found_len else {
                 break;
             };
-            if let Some(data) = conn.next(Some(len)) {
+            if let Some(data) = conn.next_contiguous(Some(len)) {
                 let msg = data.freeze();
                 let sender_gfd = conn.gfd();
 

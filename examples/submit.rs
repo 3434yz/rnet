@@ -28,8 +28,8 @@ impl EventHandler for MyHandler {
     }
 
     fn on_traffic(&self, conn: &mut Connection) -> Action {
-        if let Some(datas) = conn.next(None) {
-            let _ = conn.write(&datas);
+        if let Some(datas) = conn.next_contiguous(None) {
+            let _ = conn.write_bytes(datas.freeze());
         }
 
         if let Some(engine) = &self.engine {

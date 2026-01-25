@@ -26,7 +26,7 @@ impl EventHandler for MyHandler {
 
     fn on_traffic(&self, conn: &mut Connection) -> Action {
         // let start_time = Instant::now();
-        if let Some(datas) = conn.next(None) {
+        if let Some(datas) = conn.next_contiguous(None) {
             let datas = datas.freeze();
             let gfd = conn.gfd();
             if let Some(engine) = &self.engine {

@@ -3,8 +3,18 @@ use rnet::engine::{EngineBuilder, EngineHandler};
 use rnet::handler::{Action, EventHandler};
 use rnet::options::Options;
 
-use std::io::Write;
+use clap::Parser;
 use std::sync::Arc;
+
+#[derive(Parser, Debug)]
+#[command(name = "echo-rnet", version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, default_value_t = 9000)]
+    port: u16,
+
+    #[arg(short, long, default_value_t = 8)]
+    loops: usize,
+}
 
 #[derive(Clone)]
 struct MyHandler {
@@ -18,8 +28,9 @@ impl EventHandler for MyHandler {
     }
 
     fn on_traffic(&self, conn: &mut Connection) -> Action {
-        if let Some(data) = conn.next(None) {
-            let _ = conn.write(&data);
+        if let Some(data) = conn.next_vectored(None) {
+            let bufs: Vec<_> = data.into_iter().map(|bs| bs.freeze()).collect();
+            let _ = conn.write_vectored_bytes(&bufs);
         }
         Action::None
     }
@@ -31,35 +42,10 @@ impl EventHandler for MyHandler {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = Args::parse();
 
-    let mut port: u16 = 9000;
-    let mut num_event_loop: usize = 8;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" => {
-                if i + 1 < args.len() {
-                    port = args[i + 1].parse().expect("Invalid port number");
-                    i += 1;
-                }
-            }
-            "--loops" => {
-                if i + 1 < args.len() {
-                    num_event_loop = args[i + 1].parse().expect("Invalid num_event_loop");
-                    i += 1;
-                }
-            }
-            "--help" | "-h" => {
-                println!("Usage: echo [--port <port>] [--loops <num_event_loop>]");
-                println!("Defaults: port=9000, loops=8");
-                return;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+    let port = args.port;
+    let num_event_loop = args.loops;
 
     println!(
         "Starting server on port: {}, loops: {}",
