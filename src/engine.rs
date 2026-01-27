@@ -3,7 +3,7 @@ use crate::balancer::Balancer;
 use crate::command::Command;
 use crate::event_loop::{EventLoop, EventLoopHandle};
 use crate::gfd::Gfd;
-use crate::handler::EventHandler;
+use crate::handler::{Action, EventHandler};
 use crate::listener::Listener;
 use crate::options::{Options, get_core_ids};
 use crate::socket_addr::NetworkAddress;
@@ -27,18 +27,20 @@ impl EngineBuilder {
         }
     }
 
-    pub fn build<H, F>(
-        self,
-        options: Options,
-        handler_factory: F,
-    ) -> (Engine<H>, Arc<EngineHandler>)
+    pub fn build<H>(self, options: Options) -> io::Result<(Engine<H>, Arc<EngineHandler>)>
     where
         H: EventHandler,
-        F: FnOnce(Arc<EngineHandler>) -> H,
     {
         let options = Arc::new(options);
         let engine_handler = Arc::new(EngineHandler::new());
-        let handler = handler_factory(engine_handler.clone());
+        let (handler, action) = H::init(engine_handler.clone());
+
+        if action == Action::Shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Engine init action is Shutdown",
+            ));
+        }
 
         let lb_policy = if options.reuse_port {
             None
@@ -53,7 +55,7 @@ impl EngineBuilder {
             lb_policy,
             handle: engine_handler.clone(),
         };
-        (engine, engine_handler)
+        Ok((engine, engine_handler))
     }
 
     pub fn address(mut self, addrs: Vec<NetworkAddress>) -> Self {
@@ -146,6 +148,7 @@ where
 
         let mut workers = Vec::new();
         let mut threads = Vec::new();
+        let worker_count = cores.len();
 
         let handler = self.handler.as_ref().unwrap().clone();
         let lock_os_thread = self.options.lock_os_thread;
@@ -197,13 +200,13 @@ where
         });
         threads.push(acceptor_thread);
 
-        let worker_pool = WorkerPool::new(4);
-        // worker_pool.run(4);
+        let worker_pool = WorkerPool::new(worker_count);
 
         for t in threads {
             t.join().unwrap();
         }
 
+        worker_pool.shutdown();
         Ok(())
     }
 
@@ -259,7 +262,7 @@ where
         self.handle.set_workers(registry.clone());
 
         println!("Starting {} Business Workers...", worker_count);
-        WorkerPool::new(worker_count);
+        let worker_pool = WorkerPool::new(worker_count);
 
         for p in pending {
             let mut el = p.el;
@@ -284,18 +287,17 @@ where
             t.join().unwrap();
         }
 
+        worker_pool.shutdown();
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::codec::RawCodec;
     use crate::connection::Connection;
     use crate::engine::{EngineBuilder, EngineHandler};
     use crate::handler::{Action, EventHandler};
     use crate::options::Options;
-    use bytes::BytesMut;
 
     use std::sync::Arc;
 
@@ -305,6 +307,10 @@ mod tests {
     }
 
     impl EventHandler for GameServer {
+        fn init(engine: Arc<EngineHandler>) -> (Self, Action) {
+            (Self { engine }, Action::None)
+        }
+
         fn on_open(&self, _conn: &mut Connection) -> Action {
             println!("New Connect");
             if let Some(workers) = self.engine.eventloops.get() {
@@ -338,12 +344,10 @@ mod tests {
         ];
         let net_socket_addrs = options.normalize(&addrs).unwrap();
 
-        let (mut engine, _handler_copy) =
-            EngineBuilder::builder()
-                .address(net_socket_addrs)
-                .build(options, |engine_handler| GameServer {
-                    engine: engine_handler,
-                });
+        let (mut engine, _handler_copy) = EngineBuilder::builder()
+            .address(net_socket_addrs)
+            .build::<GameServer>(options)
+            .unwrap();
 
         engine.run().expect("run failed");
     }
@@ -363,12 +367,10 @@ mod tests {
         ];
         let net_socket_addrs = options.normalize(&addrs).unwrap();
 
-        let (mut engine, _handler_copy) =
-            EngineBuilder::builder()
-                .address(net_socket_addrs)
-                .build(options, |engine_handler| GameServer {
-                    engine: engine_handler,
-                });
+        let (mut engine, _handler_copy) = EngineBuilder::builder()
+            .address(net_socket_addrs)
+            .build::<GameServer>(options)
+            .unwrap();
 
         engine.run().expect("run failed");
     }

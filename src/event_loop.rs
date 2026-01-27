@@ -263,10 +263,10 @@ where
                     self.register(socket, local_addr, peer_addr)?
                 }
                 Command::Close(key) => self.close_connection(key, true)?,
-                Command::IORead(key) => {
+                Command::Read(key) => {
                     self.read_socket(key)?;
                 }
-                Command::IOWrite(key) => {
+                Command::Write(key) => {
                     self.write_socket(key)?;
                 }
                 Command::Wake => self.handle.waker.wake()?,
@@ -410,7 +410,7 @@ where
                 self.close_connection(key, graceful)?;
             }
             IoStatus::Yield => {
-                let _ = self.trigger(Prioity::High, Command::IORead(key));
+                let _ = self.trigger(Prioity::High, Command::Read(key));
             }
             IoStatus::Completed => {}
             IoStatus::Shutdown => {
@@ -486,7 +486,7 @@ where
                 self.close_connection(key, graceful)?;
             }
             IoStatus::Yield => {
-                let _ = self.trigger(Prioity::High, Command::IOWrite(key));
+                let _ = self.trigger(Prioity::High, Command::Write(key));
             }
             IoStatus::Completed => {
                 self.reregister(key)?;
@@ -522,8 +522,6 @@ where
                 io_slices.clear();
                 for buf in out_buffer.iter().take(IO_MAX) {
                     let slice = io::IoSlice::new(buf);
-                    // SAFETY: 我们在 write_vectored 调用后立即清空 io_slices，
-                    // 确保了 slice 的生命周期不会超出 buf 的有效范围。
                     let static_slice = unsafe {
                         std::mem::transmute::<io::IoSlice<'_>, io::IoSlice<'static>>(slice)
                     };

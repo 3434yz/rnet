@@ -6,6 +6,7 @@ use rnet::options::Options;
 
 use bytes::{Buf, BufMut, BytesMut};
 use mimalloc::MiMalloc;
+use rnet::engine::EngineHandler;
 use serde_json;
 
 use std::any::Any;
@@ -57,6 +58,10 @@ impl Codec for JsonCodec {
 struct JsonHandler;
 
 impl EventHandler for JsonHandler {
+    fn init(_engine: std::sync::Arc<EngineHandler>) -> (Self, Action) {
+        (JsonHandler, Action::None)
+    }
+
     fn on_open(&self, conn: &mut Connection) -> Action {
         // 设置连接使用 JsonCodec
         conn.set_codec(JsonCodec);
@@ -92,7 +97,8 @@ fn main() {
 
     let (mut engine, _) = EngineBuilder::builder()
         .address(net_socket_addrs)
-        .build(options, |_| JsonHandler);
+        .build::<JsonHandler>(options)
+        .unwrap();
 
     println!("Json Server running on tcp://127.0.0.1:9001");
     engine.run().unwrap();

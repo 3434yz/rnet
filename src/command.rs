@@ -8,8 +8,8 @@ pub enum Command {
     Register(Socket, NetworkAddress, NetworkAddress),
     Close(usize),
     Wake,
-    IORead(usize),
-    IOWrite(usize),
+    Read(usize),
+    Write(usize),
     Shutdown,
 }
 
@@ -21,8 +21,8 @@ impl Command {
             Command::Wake => Prioity::Low,
             Command::Register(_, _, _) => Prioity::Low,
             Command::Close(_) => Prioity::Low,
-            Command::IORead(_) => Prioity::High,
-            Command::IOWrite(_) => Prioity::High,
+            Command::Read(_) => Prioity::High,
+            Command::Write(_) => Prioity::High,
             Command::Shutdown => Prioity::High,
         }
     }

@@ -18,13 +18,17 @@ struct Args {
 
 #[derive(Clone)]
 struct MyHandler {
-    engine: Option<Arc<EngineHandler>>,
+    _engine: Option<Arc<EngineHandler>>,
 }
 
 impl EventHandler for MyHandler {
-    fn on_open(&self, _conn: &mut Connection) -> Action {
-        // println!("New Connect in {}", conn.gfd.event_loop_index());
-        Action::None
+    fn init(engine: Arc<EngineHandler>) -> (Self, Action) {
+        (
+            Self {
+                _engine: Some(engine),
+            },
+            Action::None,
+        )
     }
 
     fn on_traffic(&self, conn: &mut Connection) -> Action {
@@ -32,11 +36,6 @@ impl EventHandler for MyHandler {
             let bufs: Vec<_> = data.into_iter().map(|bs| bs.freeze()).collect();
             let _ = conn.write_vectored_bytes(&bufs);
         }
-        Action::None
-    }
-
-    fn on_close(&self, _conn: &mut Connection) -> Action {
-        // println!("Close Connect");
         Action::None
     }
 }
@@ -60,12 +59,10 @@ fn main() {
     let addrs = vec![format!("tcp://127.0.0.1:{}", port)];
     let net_socket_addrs = options.normalize(&addrs).unwrap();
 
-    let (mut engine, _handler_copy) =
-        EngineBuilder::builder()
-            .address(net_socket_addrs)
-            .build(options, |engine_handler| MyHandler {
-                engine: Some(engine_handler),
-            });
+    let (mut engine, _handler_copy) = EngineBuilder::builder()
+        .address(net_socket_addrs)
+        .build::<MyHandler>(options)
+        .unwrap();
 
     engine.run().expect("run failed");
 }

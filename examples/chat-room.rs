@@ -24,6 +24,10 @@ impl ChatRoomHandler {
 }
 
 impl EventHandler for ChatRoomHandler {
+    fn init(engine: Arc<EngineHandler>) -> (Self, Action) {
+        (Self::new(engine), Action::None)
+    }
+
     fn on_open(&self, conn: &mut Connection) -> Action {
         println!("New user connected: {:?}", conn.peer_addr());
         self.clients.lock().unwrap().insert(conn.gfd());
@@ -90,7 +94,8 @@ fn main() {
 
     let (mut engine, _handler) = EngineBuilder::builder()
         .address(net_socket_addrs)
-        .build(options, |engine| ChatRoomHandler::new(engine));
+        .build::<ChatRoomHandler>(options)
+        .unwrap();
 
     println!("Chat room server running on tcp://127.0.0.1:8888");
     engine.run().expect("run failed");

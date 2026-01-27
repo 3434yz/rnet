@@ -19,7 +19,16 @@ struct MyHandler {
 }
 
 impl EventHandler for MyHandler {
-    fn on_open(&self, conn: &mut Connection) -> Action {
+    fn init(engine: Arc<EngineHandler>) -> (Self, Action) {
+        (
+            Self {
+                engine: Some(engine),
+            },
+            Action::None,
+        )
+    }
+
+    fn on_open(&self, _conn: &mut Connection) -> Action {
         // println!("New Connect in {}", conn.gfd.event_loop_index());
         Action::None
     }
@@ -88,12 +97,10 @@ fn main() {
     let addrs = vec![format!("tcp://127.0.0.1:{}", port)];
     let net_socket_addrs = options.normalize(&addrs).unwrap();
 
-    let (mut engine, _handler_copy) =
-        EngineBuilder::builder()
-            .address(net_socket_addrs)
-            .build(options, |engine_handler| MyHandler {
-                engine: Some(engine_handler),
-            });
+    let (mut engine, _handler_copy) = EngineBuilder::builder()
+        .address(net_socket_addrs)
+        .build::<MyHandler>(options)
+        .unwrap();
 
     engine.run().expect("run failed");
 }

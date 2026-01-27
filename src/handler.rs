@@ -1,9 +1,8 @@
-use crate::{connection::Connection, engine::EngineHandler};
-
-use bytes::BytesMut;
-
+use crate::connection::Connection;
+use crate::engine::EngineHandler;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
     Close,
@@ -11,11 +10,19 @@ pub enum Action {
 }
 
 pub trait EventHandler: Send + Sync + 'static {
-    // fn on_boot(engine: Arc<EngineHandler>) -> Action;
+    fn init(engine: Arc<EngineHandler>) -> (Self, Action)
+    where
+        Self: Sized;
 
-    fn on_open(&self, conn: &mut Connection) -> Action;
+    fn on_open(&self, _conn: &mut Connection) -> Action {
+        Action::None
+    }
 
-    fn on_traffic(&self, conn: &mut Connection) -> Action;
+    fn on_traffic(&self, _conn: &mut Connection) -> Action {
+        Action::None
+    }
 
-    fn on_close(&self, conn: &mut Connection) -> Action;
+    fn on_close(&self, _conn: &mut Connection) -> Action {
+        Action::None
+    }
 }

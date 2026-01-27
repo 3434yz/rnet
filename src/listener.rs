@@ -43,7 +43,6 @@ impl Listener {
             NetworkAddress::Tcp(socket_addr) => {
                 let listener = create_mio_tcp_listener(socket_addr, &options, backlog)?;
 
-                // 2. 获取实际端口信息
                 let local_addr = listener.local_addr()?;
                 Ok(Listener {
                     inner: ListenerInner::Tcp(listener),
@@ -245,7 +244,7 @@ fn configure_socket(socket: &socket2::Socket, options: &Options) -> io::Result<(
         socket.set_send_buffer_size(options.socket_send_buffer)?;
     }
 
-    #[cfg(linux)]
+    #[cfg(target_os = "linux")]
     if !options.bind_to_device.is_empty() {
         let device = options.bind_to_device.as_bytes();
         socket.bind_device(Some(device))?;
