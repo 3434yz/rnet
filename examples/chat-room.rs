@@ -57,7 +57,7 @@ impl EventHandler for ChatRoomHandler {
                     .filter(|&&c| c != sender_gfd)
                     .cloned()
                     .collect();
-                drop(clients_guard); // 尽早释放锁
+                drop(clients_guard);
 
                 let engine = self.engine.clone().unwrap();
                 worker::submit(

@@ -25,4 +25,10 @@ pub trait EventHandler: Send + Sync + 'static {
     fn on_close(&self, _conn: &mut Connection) -> Action {
         Action::None
     }
+
+    fn on_tick(&self) -> (std::time::Duration, Action) {
+        (std::time::Duration::from_secs(0), Action::None)
+    }
+
+    fn on_shutdon(&self) {}
 }

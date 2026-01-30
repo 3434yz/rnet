@@ -451,61 +451,64 @@ impl Write for Connection {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(out_buffer) = &mut self.out_buffer {
-            let socket = &mut self.socket;
-            IO_SLICES.with(|cells| {
-                let mut io_slices = cells.borrow_mut();
-                while !out_buffer.is_empty() {
-                    io_slices.clear();
-                    for buf in out_buffer.iter().take(IO_MAX) {
-                        let slice = std::io::IoSlice::new(buf);
-                        let static_slice = unsafe {
-                            std::mem::transmute::<std::io::IoSlice<'_>, std::io::IoSlice<'static>>(
-                                slice,
-                            )
-                        };
-                        io_slices.push(static_slice);
+        let out_buffer = match &mut self.out_buffer {
+            Some(buf) => buf,
+            None => return self.socket.flush(),
+        };
+
+        let socket = &mut self.socket;
+        IO_SLICES.with(|cells| {
+            let mut io_slices = cells.borrow_mut();
+            while !out_buffer.is_empty() {
+                io_slices.clear();
+                for buf in out_buffer.iter().take(IO_MAX) {
+                    let slice = std::io::IoSlice::new(buf);
+                    let static_slice = unsafe {
+                        std::mem::transmute::<std::io::IoSlice<'_>, std::io::IoSlice<'static>>(
+                            slice,
+                        )
+                    };
+                    io_slices.push(static_slice);
+                }
+
+                let res = socket.write_vectored(&io_slices);
+                io_slices.clear();
+
+                match res {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "connection closed",
+                        ));
                     }
-
-                    let res = socket.write_vectored(&io_slices);
-                    io_slices.clear();
-
-                    match res {
-                        Ok(0) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "connection closed",
-                            ));
-                        }
-                        Ok(n) => {
-                            let mut written = n;
-                            while written > 0 {
-                                if let Some(front) = out_buffer.front_mut() {
-                                    if front.len() <= written {
-                                        written -= front.len();
-                                        out_buffer.pop_front();
-                                    } else {
-                                        front.advance(written);
-                                        written = 0;
-                                    }
+                    Ok(n) => {
+                        let mut written = n;
+                        while written > 0 {
+                            if let Some(front) = out_buffer.front_mut() {
+                                if front.len() <= written {
+                                    written -= front.len();
+                                    out_buffer.pop_front();
                                 } else {
-                                    break;
+                                    front.advance(written);
+                                    written = 0;
                                 }
+                            } else {
+                                break;
                             }
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WouldBlock,
-                                "flush would block",
-                            ));
-                        }
-                        Err(e) => return Err(e),
                     }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "flush would block",
+                        ));
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(())
-            })?;
-        }
+            }
+            Ok(())
+        })?;
         self.socket.flush()
     }
 
