@@ -37,7 +37,7 @@ thread_local! {
 
 pub struct Connection {
     pub(crate) gfd: Gfd,
-    pub(crate) socket: Socket,
+    pub(crate) socket: Option<Socket>,
     pub(crate) local_addr: NetworkAddress,
     pub(crate) peer_addr: NetworkAddress,
     pub(crate) closed: bool,
@@ -60,7 +60,7 @@ impl Connection {
     ) -> Self {
         Self {
             gfd,
-            socket,
+            socket: Some(socket),
             local_addr,
             peer_addr,
             closed: false,
@@ -70,6 +70,35 @@ impl Connection {
             handle,
             options,
             codec: None,
+        }
+    }
+
+    pub fn reset(
+        &mut self,
+        gfd: Gfd,
+        socket: Socket,
+        options: Arc<Options>,
+        local_addr: NetworkAddress,
+        peer_addr: NetworkAddress,
+        handle: Arc<EventLoopHandle>,
+    ) {
+        self.gfd = gfd;
+        self.socket = Some(socket);
+        self.local_addr = local_addr;
+        self.peer_addr = peer_addr;
+        self.closed = false;
+        self.handle = handle;
+        self.options = options;
+        self.codec = None;
+
+        if let Some(buf) = self.in_buffer.as_mut() {
+            buf.clear();
+        }
+        if let Some(buf) = self.io_buffer.as_mut() {
+            buf.clear();
+        }
+        if let Some(buf) = self.out_buffer.as_mut() {
+            buf.clear();
         }
     }
 
@@ -290,7 +319,7 @@ impl Connection {
             }
         }
 
-        match self.socket.write(&buf) {
+        match self.socket.as_mut().unwrap().write(&buf) {
             Ok(n) => {
                 if n < len {
                     let remaining = buf.slice(n..);
@@ -336,7 +365,7 @@ impl Connection {
                 };
                 io_slices.push(static_slice);
             }
-            self.socket.write_vectored(&io_slices)
+            self.socket.as_mut().unwrap().write_vectored(&io_slices)
         });
 
         match res {
@@ -422,7 +451,7 @@ impl Write for Connection {
             }
         }
 
-        match self.socket.write(buf) {
+        match self.socket.as_mut().unwrap().write(buf) {
             Ok(n) => {
                 if n < buf.len() {
                     let remaining = Bytes::copy_from_slice(&buf[n..]);
@@ -453,10 +482,10 @@ impl Write for Connection {
     fn flush(&mut self) -> std::io::Result<()> {
         let out_buffer = match &mut self.out_buffer {
             Some(buf) => buf,
-            None => return self.socket.flush(),
+            None => return self.socket.as_mut().unwrap().flush(),
         };
 
-        let socket = &mut self.socket;
+        let socket = self.socket.as_mut().unwrap();
         IO_SLICES.with(|cells| {
             let mut io_slices = cells.borrow_mut();
             while !out_buffer.is_empty() {
@@ -509,7 +538,7 @@ impl Write for Connection {
             }
             Ok(())
         })?;
-        self.socket.flush()
+        self.socket.as_mut().unwrap().flush()
     }
 
     fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
@@ -527,7 +556,7 @@ impl Write for Connection {
             }
         }
 
-        match self.socket.write_vectored(bufs) {
+        match self.socket.as_mut().unwrap().write_vectored(bufs) {
             Ok(n) => {
                 if n < total_len {
                     let mut written = n;

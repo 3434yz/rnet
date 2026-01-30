@@ -79,6 +79,7 @@ impl EventHandler for ChatRoomHandler {
     fn on_close(&self, conn: &mut Connection) -> Action {
         println!("User disconnected: {:?}", conn.peer_addr());
         self.clients.lock().unwrap().remove(&conn.gfd());
+        conn.close();
         Action::None
     }
 }

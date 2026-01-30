@@ -1,5 +1,6 @@
 use crate::connection::Connection;
 use crate::engine::EngineHandler;
+use slab::Slab;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,6 +8,16 @@ pub enum Action {
     None,
     Close,
     Shutdown,
+}
+
+pub struct TickContext<'a> {
+    pub(crate) connections: &'a mut Slab<Connection>,
+}
+
+impl<'a> TickContext<'a> {
+    pub fn connections(&mut self) -> impl Iterator<Item = &mut Connection> {
+        self.connections.iter_mut().map(|(_, c)| c)
+    }
 }
 
 pub trait EventHandler: Send + Sync + 'static {
@@ -26,7 +37,7 @@ pub trait EventHandler: Send + Sync + 'static {
         Action::None
     }
 
-    fn on_tick(&self) -> (std::time::Duration, Action) {
+    fn on_tick(&self, _ctx: &mut TickContext) -> (std::time::Duration, Action) {
         (std::time::Duration::from_secs(0), Action::None)
     }
 

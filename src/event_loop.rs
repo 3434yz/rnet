@@ -1,7 +1,7 @@
 use crate::command::{Command, Prioity};
 use crate::connection::Connection;
 use crate::gfd::Gfd;
-use crate::handler::{Action, EventHandler};
+use crate::handler::{Action, EventHandler, TickContext};
 use crate::listener::Listener;
 use crate::options::Options;
 use crate::poller::{Poller, Waker};
@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const EVENTS_CAP: usize = 1024;
 const MAX_POLL_EVENT_CAP: usize = 1024;
@@ -107,6 +107,7 @@ where
     urgent_receiver: Receiver<Command>,
     common_receiver: Receiver<Command>,
     handle: Arc<EventLoopHandle>,
+    connection_pool: Vec<Connection>,
 }
 
 impl<H> EventLoop<H>
@@ -127,7 +128,7 @@ where
         let waker = Arc::new(Waker::new(poll.registry())?);
         // let buffer = Some(IOBuffer::new(options.read_buffer_cap));
         let io_buffer = BytesMut::with_capacity(options.read_buffer_cap);
-        let connections = Slab::with_capacity(4096);
+        let connections = Slab::new();
 
         let handle = EventLoopHandle::new(
             loop_id as usize,
@@ -149,6 +150,7 @@ where
             common_receiver,
             handle,
             options,
+            connection_pool: Vec::new(),
         })
     }
 
@@ -169,11 +171,12 @@ where
 
     fn reregister(&mut self, key: usize) -> io::Result<()> {
         if let Some(conn) = self.connections.get_mut(key) {
+            let socket = conn.socket.as_mut().unwrap();
             let is_empty = conn.out_buffer.as_ref().map_or(true, |b| b.is_empty());
             if is_empty {
-                self.poll.disable_write(&mut conn.socket, Token(key))?;
+                self.poll.disable_write(socket, Token(key))?;
             } else {
-                self.poll.enable_write(&mut conn.socket, Token(key))?;
+                self.poll.enable_write(socket, Token(key))?;
             }
         }
         Ok(())
@@ -192,10 +195,36 @@ where
 
     fn run_loop(&mut self) -> io::Result<()> {
         let mut events = Events::with_capacity(EVENTS_CAP);
+        let mut next_tick = if self.options.ticker {
+            let mut ctx = TickContext {
+                connections: &mut self.connections,
+            };
+            let (delay, action) = self.handler.on_tick(&mut ctx);
+            if action == Action::Shutdown {
+                self.shutdown();
+                return Ok(());
+            }
+            if delay.is_zero() {
+                None
+            } else {
+                Some(Instant::now() + delay)
+            }
+        } else {
+            None
+        };
+
         loop {
             let has_pending = !self.urgent_receiver.is_empty() || !self.common_receiver.is_empty();
+
             let timeout = if has_pending {
                 Some(Duration::ZERO)
+            } else if let Some(tick) = next_tick {
+                let now = Instant::now();
+                if now >= tick {
+                    Some(Duration::ZERO)
+                } else {
+                    Some(tick - now)
+                }
             } else {
                 None
             };
@@ -220,6 +249,32 @@ where
                     self.accept_process(idx)?;
                 } else {
                     self.process_io(token, &event)?;
+                }
+            }
+
+            if let Some(tick) = next_tick {
+                if Instant::now() >= tick {
+                    let mut ctx = TickContext {
+                        connections: &mut self.connections,
+                    };
+                    let (delay, action) = self.handler.on_tick(&mut ctx);
+
+                    match action {
+                        Action::Shutdown => {
+                            self.shutdown();
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "EventLoop Shutdown",
+                            ));
+                        }
+                        _ => {}
+                    }
+
+                    next_tick = if delay.is_zero() {
+                        None
+                    } else {
+                        Some(Instant::now() + delay)
+                    };
                 }
             }
         }
@@ -357,14 +412,26 @@ where
         self.poll.register(&mut socket, token)?;
 
         let gfd = Gfd::new(socket.fd(), self.loop_id, token.0);
-        let mut conn = Connection::new(
-            gfd,
-            socket,
-            self.options.clone(),
-            local_addr,
-            peer_addr,
-            self.handle.clone(),
-        );
+        let mut conn = if let Some(mut c) = self.connection_pool.pop() {
+            c.reset(
+                gfd,
+                socket,
+                self.options.clone(),
+                local_addr,
+                peer_addr,
+                self.handle.clone(),
+            );
+            c
+        } else {
+            Connection::new(
+                gfd,
+                socket,
+                self.options.clone(),
+                local_addr,
+                peer_addr,
+                self.handle.clone(),
+            )
+        };
         match self.handler.on_open(&mut conn) {
             Action::Close => self.close_connection(token.0, true)?,
             Action::None => {
@@ -386,17 +453,23 @@ where
         if !self.connections.contains(key) {
             return Ok(());
         }
-        let conn = self.connections.get_mut(key).unwrap();
 
-        if graceful {
-            let _ = conn.flush();
-        } else {
-            conn.out_buffer = None;
+        {
+            let conn = self.connections.get_mut(key).unwrap();
+            if graceful {
+                let _ = conn.flush();
+            } else {
+                conn.out_buffer = None;
+            }
+            self.handler.on_close(conn);
+            if let Some(socket) = conn.socket.as_mut() {
+                self.poll.deregister(socket)?;
+            }
         }
 
-        self.handler.on_close(conn);
-        self.poll.deregister(&mut conn.socket)?;
-        self.connections.remove(key);
+        let mut conn = self.connections.remove(key);
+        conn.socket = None;
+        self.connection_pool.push(conn);
 
         self.handle.conn_count.fetch_sub(1, Ordering::Relaxed);
         Ok(())
@@ -450,7 +523,7 @@ where
                 unsafe { self.io_buffer.set_len(read_buffer_cap) };
             }
 
-            match conn.socket.read(&mut self.io_buffer) {
+            match conn.socket.as_mut().unwrap().read(&mut self.io_buffer) {
                 Ok(0) => return Ok(IoStatus::Closed(true)),
                 Ok(n) => {
                     bytes_read += n;
@@ -510,7 +583,7 @@ where
             _ => return Ok(IoStatus::Completed),
         };
 
-        let socket = &mut conn.socket;
+        let socket = conn.socket.as_mut().unwrap();
         let mut bytes_written = 0;
         IO_SLICES.with(|cells| {
             let mut io_slices = cells.borrow_mut();

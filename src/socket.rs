@@ -1,5 +1,3 @@
-use crate::socket_addr::NetworkAddress;
-
 use mio::net::{TcpStream, UnixStream};
 use mio::{Interest, Registry, Token, event::Source};
 
@@ -32,26 +30,6 @@ impl Socket {
                 use std::os::unix::io::AsRawFd;
                 s.as_raw_fd() as i64
             }
-        }
-    }
-
-    pub(crate) fn local_addr(&self) -> io::Result<NetworkAddress> {
-        match self {
-            Self::Tcp(s) => s.local_addr().map(NetworkAddress::Tcp),
-            #[cfg(unix)]
-            Self::Unix(s) => s
-                .local_addr()
-                .and_then(|addr| NetworkAddress::try_from(addr)),
-        }
-    }
-
-    pub(crate) fn peer_addr(&self) -> io::Result<NetworkAddress> {
-        match self {
-            Socket::Tcp(tcp) => tcp.peer_addr().map(NetworkAddress::Tcp),
-            #[cfg(unix)]
-            Socket::Unix(unix) => unix
-                .peer_addr()
-                .and_then(|addr| NetworkAddress::try_from(addr)),
         }
     }
 
