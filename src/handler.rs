@@ -1,5 +1,6 @@
 use crate::connection::Connection;
 use crate::engine::EngineHandler;
+use crate::options::Options;
 use slab::Slab;
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ impl<'a> TickContext<'a> {
 }
 
 pub trait EventHandler: Send + Sync + 'static {
-    fn init(engine: Arc<EngineHandler>) -> (Self, Action)
+    fn init(engine: Arc<EngineHandler>, options: Arc<Options>) -> (Self, Action)
     where
         Self: Sized;
 

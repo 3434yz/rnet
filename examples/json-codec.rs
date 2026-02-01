@@ -58,7 +58,10 @@ impl Codec for JsonCodec {
 struct JsonHandler;
 
 impl EventHandler for JsonHandler {
-    fn init(_engine: std::sync::Arc<EngineHandler>) -> (Self, Action) {
+    fn init(
+        _engine: std::sync::Arc<EngineHandler>,
+        _options: std::sync::Arc<Options>,
+    ) -> (Self, Action) {
         (JsonHandler, Action::None)
     }
 

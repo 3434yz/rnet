@@ -21,7 +21,7 @@ impl MyHandler {
 }
 
 impl EventHandler for MyHandler {
-    fn init(engine: Arc<EngineHandler>) -> (Self, Action) {
+    fn init(engine: Arc<EngineHandler>, _options: Arc<Options>) -> (Self, Action) {
         (
             Self {
                 engine: Some(engine),

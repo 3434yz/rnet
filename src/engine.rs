@@ -33,7 +33,7 @@ impl EngineBuilder {
     {
         let options = Arc::new(options);
         let engine_handler = Arc::new(EngineHandler::new());
-        let (handler, action) = H::init(engine_handler.clone());
+        let (handler, action) = H::init(engine_handler.clone(), options.clone());
 
         if action == Action::Shutdown {
             return Err(io::Error::new(
@@ -307,7 +307,7 @@ mod tests {
     }
 
     impl EventHandler for GameServer {
-        fn init(engine: Arc<EngineHandler>) -> (Self, Action) {
+        fn init(engine: Arc<EngineHandler>, _options: Arc<Options>) -> (Self, Action) {
             (Self { engine }, Action::None)
         }
 
