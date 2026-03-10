@@ -6,25 +6,22 @@ pub trait LoadBalancer: Send + Sync {
     fn select(&self, workers: &[Arc<EventLoopHandle>]) -> usize;
 }
 
-pub enum Balancer {
-    RoundRobin(RoundRobin),
-    LeastConnections(LeastConnections),
+pub struct Balancer {
+    inner: Box<dyn LoadBalancer>,
 }
 
 impl Balancer {
     pub fn new(option: LoadBalancing) -> Self {
-        match option {
-            LoadBalancing::RoundRobin => Self::RoundRobin(RoundRobin::default()),
-            LoadBalancing::LeastConnections => Self::LeastConnections(LeastConnections::default()),
+        let inner: Box<dyn LoadBalancer> = match option {
+            LoadBalancing::RoundRobin => Box::new(RoundRobin::default()),
+            LoadBalancing::LeastConnections => Box::new(LeastConnections::default()),
             LoadBalancing::SourceAddrHash => todo!(),
-        }
+        };
+        Self { inner }
     }
 
     pub fn select(&self, workers: &[Arc<EventLoopHandle>]) -> usize {
-        match self {
-            Self::RoundRobin(inner) => inner.select(workers),
-            Self::LeastConnections(inner) => inner.select(workers),
-        }
+        self.inner.select(workers)
     }
 }
 
